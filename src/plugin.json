@@ -1,0 +1,14 @@
+{
+  "id": "@signalsandsorcery/chat-panel",
+  "displayName": "Chat",
+  "version": "1.0.0",
+  "description": "AI-powered audio manipulation via natural language (scene-scoped)",
+  "generatorType": "hybrid",
+  "main": "index.js",
+  "author": "Signals & Sorcery",
+  "minHostVersion": "1.1.0",
+  "builtIn": true,
+  "capabilities": {
+    "requiresLLM": true
+  }
+}
