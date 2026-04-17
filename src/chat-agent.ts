@@ -68,6 +68,34 @@ export interface AgentResponse {
   iterationLimitHit?: boolean;
 }
 
+/**
+ * Per-iteration events emitted as the loop makes progress. The UI subscribes
+ * to these to render a terminal-style running log while the turn is in
+ * flight. The LLM call itself is not streamed — these events surface what
+ * the agent observably does each iteration.
+ */
+export type ChatAgentEvent =
+  | {
+      type: 'tool_call_start';
+      iteration: number;
+      callId: string;
+      tool: string;
+      params: Record<string, unknown>;
+    }
+  | {
+      type: 'tool_call_done';
+      iteration: number;
+      callId: string;
+      tool: string;
+      params: Record<string, unknown>;
+      result?: unknown;
+      error?: string;
+    }
+  | { type: 'iteration_limit' }
+  | { type: 'final_text'; content: string };
+
+export type ChatAgentEventHandler = (event: ChatAgentEvent) => void;
+
 export interface ChatAgentOptions {
   llm: LLMCallFn;
   tools: ChatAgentTool[];
@@ -76,6 +104,8 @@ export interface ChatAgentOptions {
   maxIterations?: number;
   /** System-prompt preamble. A sensible default is provided. */
   systemPromptPrefix?: string;
+  /** Default handler invoked on every loop event. Can be overridden per-call. */
+  onEvent?: ChatAgentEventHandler;
 }
 
 // -----------------------------------------------------------------------------
@@ -105,6 +135,7 @@ export class ChatAgent {
   private readonly buildSceneContext: () => Promise<string>;
   private readonly maxIterations: number;
   private readonly systemPromptPrefix: string;
+  private readonly defaultOnEvent?: ChatAgentEventHandler;
 
   private history: LLMMessage[] = [];
 
@@ -114,6 +145,7 @@ export class ChatAgent {
     this.buildSceneContext = options.buildSceneContext;
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     this.systemPromptPrefix = options.systemPromptPrefix ?? DEFAULT_SYSTEM_PROMPT;
+    this.defaultOnEvent = options.onEvent;
   }
 
   /**
@@ -124,7 +156,20 @@ export class ChatAgent {
     this.history = [];
   }
 
-  async handleUserMessage(message: string): Promise<AgentResponse> {
+  async handleUserMessage(
+    message: string,
+    onEvent?: ChatAgentEventHandler
+  ): Promise<AgentResponse> {
+    const emit = (event: ChatAgentEvent): void => {
+      const handler = onEvent ?? this.defaultOnEvent;
+      if (!handler) return;
+      try {
+        handler(event);
+      } catch {
+        // Event handlers must never break the loop.
+      }
+    };
+
     this.history.push({ role: 'user', content: message });
 
     const actions: ActionLogEntry[] = [];
@@ -142,6 +187,7 @@ export class ChatAgent {
 
       if (response.type === 'text') {
         this.history.push({ role: 'assistant', content: response.content });
+        emit({ type: 'final_text', content: response.content });
         return { text: response.content, actions };
       }
 
@@ -149,6 +195,14 @@ export class ChatAgent {
       let anyMutation = false;
       for (const call of response.toolCalls) {
         const tool = this.tools.find((t) => t.name === call.name);
+        emit({
+          type: 'tool_call_start',
+          iteration,
+          callId: call.id,
+          tool: call.name,
+          params: call.parameters,
+        });
+
         if (!tool) {
           const error = `Unknown tool: ${call.name}`;
           actions.push({
@@ -161,6 +215,14 @@ export class ChatAgent {
             role: 'tool',
             content: JSON.stringify({ error }),
             toolCallId: call.id,
+          });
+          emit({
+            type: 'tool_call_done',
+            iteration,
+            callId: call.id,
+            tool: call.name,
+            params: call.parameters,
+            error,
           });
           continue;
         }
@@ -178,6 +240,14 @@ export class ChatAgent {
             content: JSON.stringify(result ?? null),
             toolCallId: call.id,
           });
+          emit({
+            type: 'tool_call_done',
+            iteration,
+            callId: call.id,
+            tool: call.name,
+            params: call.parameters,
+            result,
+          });
           if (tool.mutates) anyMutation = true;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -191,6 +261,14 @@ export class ChatAgent {
             role: 'tool',
             content: JSON.stringify({ error: msg }),
             toolCallId: call.id,
+          });
+          emit({
+            type: 'tool_call_done',
+            iteration,
+            callId: call.id,
+            tool: call.name,
+            params: call.parameters,
+            error: msg,
           });
         }
       }
@@ -206,6 +284,8 @@ export class ChatAgent {
     // (or user) can decide whether to continue.
     const cap = `I hit my iteration limit (${this.maxIterations}). Here's what I did so far — let me know if you want me to continue.`;
     this.history.push({ role: 'assistant', content: cap });
+    emit({ type: 'iteration_limit' });
+    emit({ type: 'final_text', content: cap });
     return { text: cap, actions, iterationLimitHit: true };
   }
 

@@ -1,20 +1,26 @@
 /**
  * ChatPanelPlugin — `GeneratorPlugin` conforming the chat panel to the SDK.
  *
- * Wiring:
- *   - activate(host): builds a ChatAgent wired to the host's LLM and tool
- *     surface, via the llm-adapter and panel-tools modules.
- *   - deactivate(): clears state.
- *   - getUIComponent(): returns a React component for the accordion panel
- *     (placeholder UI for v1 — logic is fully testable without the UI).
- *   - getSkills(): declares the external-agent `chat` skill.
- *   - onSceneChanged(): drops the conversation — chat is scene-scoped
- *     (same intent as the existing SynthGenerator lifecycle).
+ * Two entry paths converge on a ChatAgent:
+ *
+ *   1. External-agent skill: `plugin:chat-panel:chat`
+ *      Main process calls `activate(host)` → `this.agent` is ready.
+ *      Skill dispatcher calls `this.chat({ message })`.
+ *
+ *   2. In-app chat textbox (renderer)
+ *      PluginAccordionSection instantiates a fresh ChatPanelPlugin in the
+ *      renderer and NEVER calls `activate()` — it hands a host to the UI
+ *      via `PluginUIProps.host`. So the UI component builds its own
+ *      ChatAgent from `props.host` lazily on first send.
+ *
+ * Agent construction is async because `buildPanelTools` asks the host for
+ * its full scene-scoped tool surface (`listAppTools`). The first message
+ * pays the list cost once; subsequent sends reuse the cached agent.
  *
  * Section 14 of ai-orchestration-design.md.
  */
 
-import React, { type ComponentType } from 'react';
+import React, { useEffect, useRef, type ComponentType } from 'react';
 import type {
   GeneratorPlugin,
   PluginHost,
@@ -22,9 +28,10 @@ import type {
   PluginSkill,
   PluginUIProps,
 } from '@signalsandsorcery/plugin-sdk';
-import { ChatAgent, type AgentResponse } from './chat-agent';
+import { ChatAgent, type AgentResponse, type ChatAgentEvent } from './chat-agent';
 import { makeLLMAdapter, type PluginHostLLMFn } from './llm-adapter';
 import { buildPanelTools, buildSceneContextSnapshot, type PanelHost } from './panel-tools';
+import { ChatPanel } from './ui/ChatPanel';
 
 export const CHAT_PANEL_PLUGIN_ID = '@signalsandsorcery/chat-panel';
 
@@ -33,20 +40,46 @@ export interface ChatInvocation {
 }
 
 // -----------------------------------------------------------------------------
-// Minimal placeholder UI component.
-//
-// The production component (message list, action log, streaming status, scene
-// chat history) is UI polish scheduled for the next iteration. This
-// placeholder satisfies the GeneratorPlugin contract so the plugin can
-// register and external agents can call `plugin:chat-panel:chat` today.
+// Helpers
 // -----------------------------------------------------------------------------
 
-const ChatPanelStubUI: ComponentType<PluginUIProps> = () => {
-  return React.createElement(
-    'div',
-    { style: { padding: 16, fontSize: 13, opacity: 0.7 } },
-    'Chat panel — UI pending. External agents can delegate to this panel via the `chat` skill today; the in-app textbox ships in a follow-up.'
-  );
+async function buildAgentFromHost(host: PluginHost): Promise<ChatAgent> {
+  const panelHost = host as unknown as PanelHost;
+  const hostLLM: PluginHostLLMFn = (req) => host.generateWithLLM(req);
+  const adapter = makeLLMAdapter(hostLLM);
+  const tools = await buildPanelTools(panelHost);
+  return new ChatAgent({
+    llm: adapter,
+    tools,
+    buildSceneContext: () => buildSceneContextSnapshot(panelHost),
+  });
+}
+
+// -----------------------------------------------------------------------------
+// UI component — self-contained; builds its own ChatAgent from the host prop
+// lazily on first send, and rebuilds when host or active scene changes.
+// -----------------------------------------------------------------------------
+
+const ChatPanelUI: ComponentType<PluginUIProps> = ({ host, activeSceneId }) => {
+  const agentRef = useRef<ChatAgent | null>(null);
+
+  // Reset the agent (and its conversation history) when host or scene change.
+  // Fresh tool list + fresh scene context on the next send.
+  useEffect(() => {
+    agentRef.current = null;
+  }, [host, activeSceneId]);
+
+  const sendMessage = async (
+    message: string,
+    onEvent: (event: ChatAgentEvent) => void
+  ): Promise<AgentResponse> => {
+    if (!agentRef.current) {
+      agentRef.current = await buildAgentFromHost(host);
+    }
+    return await agentRef.current.handleUserMessage(message, onEvent);
+  };
+
+  return React.createElement(ChatPanel, { sendMessage });
 };
 
 // -----------------------------------------------------------------------------
@@ -56,26 +89,17 @@ const ChatPanelStubUI: ComponentType<PluginUIProps> = () => {
 export class ChatPanelPlugin implements GeneratorPlugin {
   readonly id = CHAT_PANEL_PLUGIN_ID;
   readonly displayName = 'Chat';
-  readonly version = '1.0.0';
+  readonly version = '1.1.0';
   readonly description = 'AI-powered audio manipulation via natural language (scene-scoped)';
   readonly generatorType = 'hybrid' as const;
-  readonly minHostVersion = '1.1.0';
+  readonly minHostVersion = '1.3.0';
 
   private host: PluginHost | null = null;
   private agent: ChatAgent | null = null;
 
   async activate(host: PluginHost): Promise<void> {
     this.host = host;
-    const panelHost = host as unknown as PanelHost;
-    const hostLLM: PluginHostLLMFn = (req) => host.generateWithLLM(req);
-    const adapter = makeLLMAdapter(hostLLM);
-    const tools = buildPanelTools(panelHost);
-
-    this.agent = new ChatAgent({
-      llm: adapter,
-      tools,
-      buildSceneContext: () => buildSceneContextSnapshot(panelHost),
-    });
+    this.agent = await buildAgentFromHost(host);
   }
 
   async deactivate(): Promise<void> {
@@ -84,7 +108,7 @@ export class ChatPanelPlugin implements GeneratorPlugin {
   }
 
   getUIComponent(): ComponentType<PluginUIProps> {
-    return ChatPanelStubUI;
+    return ChatPanelUI;
   }
 
   getSettingsSchema(): PluginSettingsSchema | null {
@@ -112,13 +136,15 @@ export class ChatPanelPlugin implements GeneratorPlugin {
   }
 
   async onSceneChanged(_sceneId: string | null): Promise<void> {
-    // Chat is scene-scoped — switching scenes starts a fresh conversation.
+    // Chat is scene-scoped — switching scenes starts a fresh conversation
+    // on the main-process agent. The renderer UI resets itself via the
+    // activeSceneId effect in ChatPanelUI.
     this.agent?.clearHistory();
   }
 
   // ---------------------------------------------------------------------------
-  // Entrypoint — called by the external-agent skill dispatcher AND (once the
-  // UI lands) by the in-app chat textbox. Both paths converge here.
+  // External-agent entrypoint — called by the skill dispatcher in the main
+  // process after activate(host) has bound `this.agent`.
   // ---------------------------------------------------------------------------
 
   async chat(params: ChatInvocation): Promise<AgentResponse> {

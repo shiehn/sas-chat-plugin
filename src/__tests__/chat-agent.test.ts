@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import {
   ChatAgent,
+  type ChatAgentEvent,
   type ChatAgentTool,
   type LLMCallFn,
   type LLMResponse,
@@ -349,6 +350,125 @@ describe('ChatAgent', () => {
       const secondCall = llm.mock.calls[1][0];
       // After clearHistory, only the fresh user message remains
       expect(secondCall.messages.map((m) => m.content).join(' ')).not.toContain('first');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Per-iteration event stream (for terminal UI)
+  // ---------------------------------------------------------------------------
+
+  describe('onEvent stream', () => {
+    it('emits tool_call_start / tool_call_done / final_text in order', async () => {
+      const tool = makeTool('get_tracks', async () => ({ tracks: ['Bass'] }));
+      llm
+        .mockResolvedValueOnce(
+          toolResponse([{ id: 'c1', name: 'get_tracks', parameters: {} }])
+        )
+        .mockResolvedValueOnce(textResponse('Found Bass.'));
+
+      agent = new ChatAgent({ llm, tools: [tool], buildSceneContext });
+      const events: ChatAgentEvent[] = [];
+      await agent.handleUserMessage('what tracks', (e) => events.push(e));
+
+      expect(events.map((e) => e.type)).toEqual([
+        'tool_call_start',
+        'tool_call_done',
+        'final_text',
+      ]);
+      expect(events[0]).toMatchObject({
+        type: 'tool_call_start',
+        callId: 'c1',
+        tool: 'get_tracks',
+      });
+      expect(events[1]).toMatchObject({
+        type: 'tool_call_done',
+        callId: 'c1',
+        result: { tracks: ['Bass'] },
+      });
+      expect(events[2]).toMatchObject({
+        type: 'final_text',
+        content: 'Found Bass.',
+      });
+    });
+
+    it('emits a tool_call_done with an error field when the tool throws', async () => {
+      const bad = jest.fn<ChatAgentTool['handler']>().mockRejectedValue(new Error('boom'));
+      llm
+        .mockResolvedValueOnce(toolResponse([{ id: 'c1', name: 'bad', parameters: {} }]))
+        .mockResolvedValueOnce(textResponse('ok'));
+
+      agent = new ChatAgent({ llm, tools: [makeTool('bad', bad)], buildSceneContext });
+      const events: ChatAgentEvent[] = [];
+      await agent.handleUserMessage('go', (e) => events.push(e));
+
+      const doneEvent = events.find((e) => e.type === 'tool_call_done');
+      expect(doneEvent).toMatchObject({ type: 'tool_call_done', error: 'boom' });
+    });
+
+    it('emits iteration_limit followed by final_text when the cap is hit', async () => {
+      const noop = jest.fn<ChatAgentTool['handler']>().mockResolvedValue({ ok: true });
+      llm.mockResolvedValue(toolResponse([{ id: 'c1', name: 'noop', parameters: {} }]));
+
+      agent = new ChatAgent({
+        llm,
+        tools: [makeTool('noop', noop)],
+        buildSceneContext,
+        maxIterations: 2,
+      });
+      const events: ChatAgentEvent[] = [];
+      await agent.handleUserMessage('loop', (e) => events.push(e));
+
+      const types = events.map((e) => e.type);
+      const limitIdx = types.indexOf('iteration_limit');
+      const finalIdx = types.indexOf('final_text');
+      expect(limitIdx).toBeGreaterThanOrEqual(0);
+      expect(finalIdx).toBeGreaterThan(limitIdx);
+    });
+
+    it('handler thrown errors never break the agent loop', async () => {
+      const tool = makeTool('get_tracks', async () => ({ ok: true }));
+      llm
+        .mockResolvedValueOnce(toolResponse([{ id: 'c1', name: 'get_tracks', parameters: {} }]))
+        .mockResolvedValueOnce(textResponse('Done.'));
+
+      agent = new ChatAgent({ llm, tools: [tool], buildSceneContext });
+      const result = await agent.handleUserMessage('go', () => {
+        throw new Error('observer crashed');
+      });
+
+      expect(result.text).toBe('Done.');
+    });
+
+    it('AgentResponse shape is unchanged when onEvent is passed', async () => {
+      const tool = makeTool('get_tracks', async () => ({ tracks: ['Bass'] }));
+      llm
+        .mockResolvedValueOnce(
+          toolResponse([{ id: 'c1', name: 'get_tracks', parameters: {} }])
+        )
+        .mockResolvedValueOnce(textResponse('Found.'));
+
+      agent = new ChatAgent({ llm, tools: [tool], buildSceneContext });
+      const result = await agent.handleUserMessage('x', () => {});
+      expect(result.text).toBe('Found.');
+      expect(result.actions).toHaveLength(1);
+      expect(result.actions[0]).toMatchObject({
+        tool: 'get_tracks',
+        result: { tracks: ['Bass'] },
+      });
+    });
+
+    it('uses the default onEvent from options when no per-call override is given', async () => {
+      const events: ChatAgentEvent[] = [];
+      llm.mockResolvedValue(textResponse('hello'));
+      agent = new ChatAgent({
+        llm,
+        tools: [],
+        buildSceneContext,
+        onEvent: (e) => events.push(e),
+      });
+
+      await agent.handleUserMessage('hi');
+      expect(events).toEqual([{ type: 'final_text', content: 'hello' }]);
     });
   });
 

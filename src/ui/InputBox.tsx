@@ -1,14 +1,14 @@
 /**
- * InputBox — textarea + Send button.
+ * InputBox — single-line `>` prompt at the bottom of the terminal.
  *
  * Behavior:
  *   - Enter submits (Shift+Enter inserts newline)
- *   - Button disabled when empty or props.disabled
+ *   - Disabled while a turn is processing
  *   - Trims whitespace; whitespace-only never sends
  *   - Clears on successful send
  */
 
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface InputBoxProps {
   onSend: (message: string) => void;
@@ -17,7 +17,9 @@ export interface InputBoxProps {
   autoFocus?: boolean;
 }
 
-const DEFAULT_PLACEHOLDER = 'Ask the assistant… (Enter to send, Shift+Enter for newline)';
+const DEFAULT_PLACEHOLDER = 'ask anything — Enter to send, Shift+Enter for newline';
+
+const FONT = 'JetBrains Mono, SF Mono, Menlo, Monaco, Consolas, monospace';
 
 export const InputBox: React.FC<InputBoxProps> = ({
   onSend,
@@ -32,7 +34,10 @@ export const InputBox: React.FC<InputBoxProps> = ({
     if (autoFocus && textareaRef.current) {
       textareaRef.current.focus();
     }
-  }, [autoFocus]);
+    // Only run on mount — refocusing on every prop change fights the user's
+    // current focus target and breaks the `autoFocus={false}` contract.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSend = useCallback((): void => {
     if (disabled) return;
@@ -52,17 +57,24 @@ export const InputBox: React.FC<InputBoxProps> = ({
     [handleSend]
   );
 
-  const sendDisabled = disabled || text.trim() === '';
-
   return (
     <div
       style={{
         display: 'flex',
+        alignItems: 'flex-start',
         gap: 6,
-        padding: 8,
-        borderTop: '1px solid rgba(255,255,255,0.1)',
+        padding: '6px 10px 8px',
+        borderTop: '1px solid rgba(106, 242, 197, 0.15)',
+        fontFamily: FONT,
+        fontSize: 13,
       }}
     >
+      <span
+        aria-hidden
+        style={{ color: '#6AF2C5', lineHeight: '20px', userSelect: 'none' }}
+      >
+        {'>'}
+      </span>
       <textarea
         ref={textareaRef}
         value={text}
@@ -70,31 +82,23 @@ export const InputBox: React.FC<InputBoxProps> = ({
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
         disabled={disabled}
-        rows={2}
+        rows={1}
+        aria-label="Chat input"
         style={{
           flex: 1,
-          resize: 'vertical',
-          minHeight: 36,
-          fontFamily: 'inherit',
+          resize: 'none',
+          minHeight: 20,
+          background: 'transparent',
+          border: 'none',
+          outline: 'none',
+          color: '#F7FFFB',
+          fontFamily: FONT,
           fontSize: 13,
-          padding: '6px 8px',
+          lineHeight: '20px',
+          padding: 0,
+          opacity: disabled ? 0.5 : 1,
         }}
       />
-      <button
-        type="button"
-        onClick={handleSend}
-        disabled={sendDisabled}
-        aria-label="Send message"
-        style={{
-          alignSelf: 'flex-end',
-          padding: '6px 14px',
-          fontSize: 13,
-          cursor: sendDisabled ? 'not-allowed' : 'pointer',
-          opacity: sendDisabled ? 0.5 : 1,
-        }}
-      >
-        Send
-      </button>
     </div>
   );
 };

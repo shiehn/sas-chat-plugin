@@ -1,70 +1,121 @@
 /**
- * ChatPanel — top-level integration component for the chat panel plugin.
+ * ChatPanel — top-level terminal-style chat UI.
+ *
+ * Owns the running TerminalEntry[] log. Subscribes to ChatAgentEvents while
+ * a turn is in flight and appends/updates entries line-by-line. Once the
+ * final assistant text lands, all tool entries for that turn collapse to a
+ * one-line summary that the user can click to re-expand.
  *
  * Props:
- *   - sendMessage: async fn that takes a user message and returns an
- *     AgentResponse. In production this is wired to the ChatAgent from
- *     ../chat-agent.ts; in tests it's a mock.
- *   - initialMessages: optional persisted chat history (scene-scoped).
- *
- * State:
- *   - messages: the full conversation visible in the UI (user + assistant
- *     + system error messages).
- *   - isProcessing: true while a send is in flight — disables the input
- *     and shows a loading indicator.
+ *   - sendMessage: async fn that handles a user message. Receives an
+ *     onEvent callback; call it synchronously as the agent loop makes
+ *     progress. Returns the final AgentResponse.
+ *   - registerReset: optional hook the host can use to clear the log
+ *     when the scene changes (chat is scene-scoped).
  */
 
-import React, { useCallback, useState } from 'react';
-import { MessageList } from './MessageList';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { InputBox } from './InputBox';
-import type { ChatUIMessage } from './types';
-import type { AgentResponse } from '../chat-agent';
+import { TerminalLog } from './TerminalLog';
+import type { TerminalEntry } from './types';
+import type { AgentResponse, ChatAgentEvent } from '../chat-agent';
 
 export interface ChatPanelProps {
-  sendMessage: (message: string) => Promise<AgentResponse>;
-  initialMessages?: ChatUIMessage[];
+  sendMessage: (
+    message: string,
+    onEvent: (event: ChatAgentEvent) => void
+  ) => Promise<AgentResponse>;
+  initialEntries?: TerminalEntry[];
+  registerReset?: (reset: () => void) => void;
 }
 
 let idCounter = 0;
 function nextId(): string {
   idCounter += 1;
-  return `m${idCounter}-${Date.now()}`;
+  return `e${idCounter}-${Date.now()}`;
+}
+
+const BLINK_STYLE_ID = 'sas-chat-blink-style';
+
+function ensureBlinkStyle(): void {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById(BLINK_STYLE_ID)) return;
+  const style = document.createElement('style');
+  style.id = BLINK_STYLE_ID;
+  style.textContent = `
+    @keyframes sas-chat-blink {
+      0%, 49% { opacity: 0.85; }
+      50%, 100% { opacity: 0.15; }
+    }
+    .sas-chat-blink {
+      animation: sas-chat-blink 1s steps(2, start) infinite;
+    }
+  `;
+  document.head.appendChild(style);
 }
 
 export const ChatPanel: React.FC<ChatPanelProps> = ({
   sendMessage,
-  initialMessages = [],
+  initialEntries = [],
+  registerReset,
 }) => {
-  const [messages, setMessages] = useState<ChatUIMessage[]>(initialMessages);
+  const [entries, setEntries] = useState<TerminalEntry[]>(initialEntries);
   const [isProcessing, setIsProcessing] = useState(false);
+  const turnCounterRef = useRef(0);
+
+  useEffect(() => {
+    ensureBlinkStyle();
+  }, []);
+
+  useEffect(() => {
+    if (!registerReset) return;
+    registerReset(() => {
+      setEntries([]);
+      setIsProcessing(false);
+    });
+  }, [registerReset]);
+
+  const handleToggleTurn = useCallback((turnId: number): void => {
+    setEntries((prev) =>
+      prev.map((e) =>
+        e.kind === 'assistant' && e.turnId === turnId
+          ? { ...e, collapsed: !e.collapsed }
+          : e
+      )
+    );
+  }, []);
 
   const handleSend = useCallback(
     async (text: string): Promise<void> => {
-      const userMsg: ChatUIMessage = {
+      turnCounterRef.current += 1;
+      const turnId = turnCounterRef.current;
+      const userEntry: TerminalEntry = {
+        kind: 'user',
         id: nextId(),
-        role: 'user',
-        content: text,
+        turnId,
+        text,
       };
-      setMessages((prev) => [...prev, userMsg]);
+      setEntries((prev) => [...prev, userEntry]);
       setIsProcessing(true);
 
+      const onEvent = (event: ChatAgentEvent): void => {
+        setEntries((prev) => applyEvent(prev, event, turnId));
+      };
+
       try {
-        const response = await sendMessage(text);
-        const assistantMsg: ChatUIMessage = {
-          id: nextId(),
-          role: 'assistant',
-          content: response.text,
-          actions: response.actions,
-          iterationLimitHit: response.iterationLimitHit,
-        };
-        setMessages((prev) => [...prev, assistantMsg]);
+        await sendMessage(text, onEvent);
+        // Final text already appended by the `final_text` event.
+        // Collapse this turn's tool entries now that the turn is done.
+        setEntries((prev) => collapseTurn(prev, turnId));
       } catch (err) {
-        const errorMsg: ChatUIMessage = {
+        const msg = err instanceof Error ? err.message : String(err);
+        const errorEntry: TerminalEntry = {
+          kind: 'system_error',
           id: nextId(),
-          role: 'system',
-          content: err instanceof Error ? err.message : String(err),
+          turnId,
+          text: msg,
         };
-        setMessages((prev) => [...prev, errorMsg]);
+        setEntries((prev) => [...prev, errorEntry]);
       } finally {
         setIsProcessing(false);
       }
@@ -74,17 +125,103 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   return (
     <div
+      data-testid="chat-panel"
       style={{
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
         minHeight: 300,
+        background: 'transparent',
       }}
     >
-      <div style={{ flex: 1, overflowY: 'auto' }}>
-        <MessageList messages={messages} isProcessing={isProcessing} />
-      </div>
+      <TerminalLog
+        entries={entries}
+        isProcessing={isProcessing}
+        onToggleTurn={handleToggleTurn}
+      />
       <InputBox onSend={handleSend} disabled={isProcessing} />
     </div>
   );
 };
+
+// -----------------------------------------------------------------------------
+// State transitions
+// -----------------------------------------------------------------------------
+
+function applyEvent(
+  entries: TerminalEntry[],
+  event: ChatAgentEvent,
+  turnId: number
+): TerminalEntry[] {
+  switch (event.type) {
+    case 'tool_call_start':
+      return [
+        ...entries,
+        {
+          kind: 'tool_pending',
+          id: nextId(),
+          turnId,
+          callId: event.callId,
+          tool: event.tool,
+          params: event.params,
+        },
+      ];
+
+    case 'tool_call_done':
+      return entries.map((e) =>
+        e.kind === 'tool_pending' &&
+        e.turnId === turnId &&
+        e.callId === event.callId
+          ? {
+              kind: 'tool_done',
+              id: e.id,
+              turnId,
+              callId: event.callId,
+              tool: event.tool,
+              params: event.params,
+              result: event.result,
+              error: event.error,
+            }
+          : e
+      );
+
+    case 'final_text': {
+      const toolCount = entries.filter(
+        (e) =>
+          (e.kind === 'tool_done' || e.kind === 'tool_pending') &&
+          e.turnId === turnId
+      ).length;
+      return [
+        ...entries,
+        {
+          kind: 'assistant',
+          id: nextId(),
+          turnId,
+          text: event.content,
+          toolCount,
+          collapsed: false,
+        },
+      ];
+    }
+
+    case 'iteration_limit':
+      return entries.map((e) =>
+        e.kind === 'assistant' && e.turnId === turnId
+          ? { ...e, iterationLimitHit: true }
+          : e
+      );
+  }
+}
+
+function collapseTurn(entries: TerminalEntry[], turnId: number): TerminalEntry[] {
+  const hadError = entries.some(
+    (e) => e.kind === 'tool_done' && e.turnId === turnId && e.error !== undefined
+  );
+  // Turns with errors stay expanded so the user can see what went wrong.
+  if (hadError) return entries;
+  return entries.map((e) =>
+    e.kind === 'assistant' && e.turnId === turnId && e.toolCount > 0
+      ? { ...e, collapsed: true }
+      : e
+  );
+}

@@ -1,28 +1,39 @@
 /**
- * UI-layer types for the chat panel.
+ * UI-layer types for the chat panel's terminal log.
  *
- * Kept separate from ../chat-agent types so the UI can render a broader
- * surface (system messages, timestamps, per-message action logs) without
- * coupling to the agent's wire protocol.
+ * The UI is a tail-style log: each TerminalEntry is one "line block" in the
+ * scrollback. Entries arrive as ChatAgentEvents stream in during a turn.
+ * A `turnId` groups tool entries so they can be collapsed into a one-line
+ * summary once the assistant's final text lands.
  */
 
-export type ChatUIRole = 'user' | 'assistant' | 'system';
-
-export interface ChatActionEntry {
-  tool: string;
-  params: Record<string, unknown>;
-  result?: unknown;
-  error?: string;
-}
-
-export interface ChatUIMessage {
-  id: string;
-  role: ChatUIRole;
-  content: string;
-  /** Optional timestamp string (e.g. "14:23"). */
-  timestamp?: string;
-  /** Tool calls produced on this turn — only meaningful for assistant messages. */
-  actions?: ChatActionEntry[];
-  /** UI cue: agent hit its iteration cap during this turn. */
-  iterationLimitHit?: boolean;
-}
+export type TerminalEntry =
+  | { kind: 'user'; id: string; turnId: number; text: string }
+  | {
+      kind: 'tool_pending';
+      id: string;
+      turnId: number;
+      callId: string;
+      tool: string;
+      params: Record<string, unknown>;
+    }
+  | {
+      kind: 'tool_done';
+      id: string;
+      turnId: number;
+      callId: string;
+      tool: string;
+      params: Record<string, unknown>;
+      result?: unknown;
+      error?: string;
+    }
+  | {
+      kind: 'assistant';
+      id: string;
+      turnId: number;
+      text: string;
+      iterationLimitHit?: boolean;
+      toolCount: number;
+      collapsed: boolean;
+    }
+  | { kind: 'system_error'; id: string; turnId: number; text: string };

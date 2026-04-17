@@ -25,19 +25,37 @@ import { ChatPanelPlugin, CHAT_PANEL_PLUGIN_ID } from '../plugin';
 function makeHost() {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   return {
-    getPluginTracks: jest.fn<any>().mockResolvedValue([]),
-    getMusicalContext: jest.fn<any>().mockResolvedValue({ key: 'C', bpm: 120 }),
-    getActiveSceneId: jest.fn<any>().mockReturnValue(null),
-    getTrackFxState: jest.fn<any>().mockResolvedValue({}),
-    setTrackMute: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackSolo: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackVolume: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackPan: jest.fn<any>().mockResolvedValue(undefined),
-    toggleTrackFx: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackFxPreset: jest.fn<any>().mockResolvedValue({ dryWet: 0.4 }),
-    setTrackFxDryWet: jest.fn<any>().mockResolvedValue(undefined),
-    shufflePreset: jest.fn<any>().mockResolvedValue({ presetName: 'P1' }),
-    deleteTrack: jest.fn<any>().mockResolvedValue(undefined),
+    // App-tool bridge (the only surface panel-tools uses post-1.3.0 SDK).
+    listAppTools: jest.fn<any>().mockImplementation(async (_opts?: { scope?: string }) => [
+      {
+        name: 'scene_get_tracks',
+        description: 'List tracks in the active scene.',
+        inputSchema: { type: 'object', properties: {} },
+        scope: 'scene',
+      },
+      {
+        name: 'get_musical_context',
+        description: 'Get scene key/BPM.',
+        inputSchema: { type: 'object', properties: {} },
+        scope: 'scene',
+      },
+      {
+        name: 'dsl_play',
+        description: 'Start playback.',
+        inputSchema: { type: 'object', properties: {} },
+        scope: 'scene',
+      },
+    ]),
+    executeAppTool: jest.fn<any>().mockImplementation(async (name: string) => {
+      if (name === 'scene_get_tracks') {
+        return { success: true, action: name, data: { tracks: [] } };
+      }
+      if (name === 'get_musical_context') {
+        return { success: true, action: name, data: { key: 'C', bpm: 120 } };
+      }
+      return { success: true, action: name, data: null };
+    }),
+    // Host LLM used by the llm-adapter.
     generateWithLLM: jest.fn<any>().mockResolvedValue({
       content: JSON.stringify({ type: 'text', content: 'ok' }),
       tokensUsed: 5,
@@ -119,14 +137,25 @@ describe('ChatPanelPlugin — GeneratorPlugin conformance', () => {
       await expect(plugin.chat({ message: 'hi' })).rejects.toThrow(/not activated/i);
     });
 
-    it('routes a tool_use response through the panel tool surface', async () => {
+    it('routes a tool_use response through the app-tool bridge', async () => {
       const host = makeHost();
-      host.getPluginTracks.mockResolvedValue([{ id: 't-1', displayName: 'Bass', role: 'bass' }]);
+      // Override executeAppTool to return a track list when the LLM asks.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (host.executeAppTool as any).mockImplementation(async (name: string) => {
+        if (name === 'scene_get_tracks') {
+          return {
+            success: true,
+            action: name,
+            data: { tracks: [{ id: 't-1', name: 'Bass', role: 'bass' }] },
+          };
+        }
+        return { success: true, action: name, data: null };
+      });
       host.generateWithLLM
         .mockResolvedValueOnce({
           content: JSON.stringify({
             type: 'tool_use',
-            toolCalls: [{ id: 'c1', name: 'get_tracks', parameters: {} }],
+            toolCalls: [{ id: 'c1', name: 'scene_get_tracks', parameters: {} }],
           }),
           tokensUsed: 5,
           model: 'test',
@@ -143,7 +172,7 @@ describe('ChatPanelPlugin — GeneratorPlugin conformance', () => {
       const result = await plugin.chat({ message: 'what tracks' });
 
       expect(result.text).toBe('Found Bass.');
-      expect(host.getPluginTracks).toHaveBeenCalled();
+      expect(host.executeAppTool).toHaveBeenCalledWith('scene_get_tracks', {});
     });
   });
 

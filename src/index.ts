@@ -22,6 +22,8 @@ export type {
   ChatAgentOptions,
   AgentResponse,
   ActionLogEntry,
+  ChatAgentEvent,
+  ChatAgentEventHandler,
   LLMCallFn,
   LLMRequest,
   LLMResponse,

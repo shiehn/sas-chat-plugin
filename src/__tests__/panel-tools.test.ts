@@ -1,206 +1,194 @@
 /**
- * panel-tools spec — maps PluginHost methods to ChatAgentTool defs.
+ * panel-tools spec — delegates to the host's app-tool bridge.
  *
- * Each tool definition is a thin wrapper around a single PluginHost method
- * plus descriptive metadata. Tests verify:
- *   - every tool has a name, description, parameters schema, handler
- *   - handlers call the right PluginHost method with the right arguments
- *   - mutating tools are flagged `mutates: true` (so the agent loop
- *     refreshes scene context per Section 23.7)
- *   - read-only tools are NOT flagged mutates (cheap — no refresh)
+ * After the 1.3.0 SDK refactor, panel-tools stopped hand-wiring individual
+ * PluginHost methods. Instead it asks the host for every scene-scoped app
+ * tool via `host.listAppTools({ scope: 'scene' })` and wraps each as a
+ * `ChatAgentTool` whose handler calls `host.executeAppTool`.
+ *
+ * Tests verify:
+ *   - buildPanelTools returns one ChatAgentTool per app tool
+ *   - every tool is flagged `mutates: true`
+ *   - handlers delegate to `host.executeAppTool(name, params)` and unwrap
+ *     `.data` on success / throw on failure
+ *   - buildSceneContextSnapshot composes a readable string from the bridge
  */
 
 import { describe, it, expect, jest } from '@jest/globals';
 import { buildPanelTools, buildSceneContextSnapshot } from '../panel-tools';
+import type { PanelHost, PanelAppTool, PanelAppToolResult } from '../panel-tools';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// Minimal fake PluginHost — only the methods panel-tools actually uses.
-function makeHost(overrides: Record<string, any> = {}) {
-  return {
-    getPluginTracks: jest.fn<any>().mockResolvedValue([]),
-    getMusicalContext: jest.fn<any>().mockResolvedValue({ key: 'C', bpm: 120 }),
-    getActiveSceneId: jest.fn<any>().mockReturnValue('scene-1'),
-    getTrackFxState: jest.fn<any>().mockResolvedValue({}),
-    setTrackMute: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackSolo: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackVolume: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackPan: jest.fn<any>().mockResolvedValue(undefined),
-    toggleTrackFx: jest.fn<any>().mockResolvedValue(undefined),
-    setTrackFxPreset: jest.fn<any>().mockResolvedValue({ dryWet: 0.4 }),
-    setTrackFxDryWet: jest.fn<any>().mockResolvedValue(undefined),
-    shufflePreset: jest.fn<any>().mockResolvedValue({ presetName: 'P1' }),
-    deleteTrack: jest.fn<any>().mockResolvedValue(undefined),
-    ...overrides,
-  } as any;
+function makeHost(overrides: Partial<PanelHost> = {}): PanelHost {
+  const listAppTools = jest.fn<any>().mockResolvedValue([]);
+  const executeAppTool = jest.fn<any>().mockResolvedValue({
+    success: true,
+    action: 'noop',
+    data: null,
+  });
+  return { listAppTools, executeAppTool, ...overrides } as unknown as PanelHost;
 }
+
+const SAMPLE_TOOLS: PanelAppTool[] = [
+  {
+    name: 'scene_get_tracks',
+    description: 'List tracks in the active scene.',
+    inputSchema: { type: 'object', properties: {} },
+    scope: 'scene',
+  },
+  {
+    name: 'dsl_play',
+    description: 'Start playback.',
+    inputSchema: { type: 'object', properties: {} },
+    scope: 'scene',
+  },
+  {
+    name: 'dsl_track_mute',
+    description: 'Mute a track.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        trackId: { type: 'string' },
+        muted: { type: 'boolean' },
+      },
+    },
+    scope: 'scene',
+  },
+];
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 describe('buildPanelTools', () => {
-  // ---------------------------------------------------------------------------
-  // Registry shape
-  // ---------------------------------------------------------------------------
-
   describe('registry shape', () => {
-    it('returns a non-empty array of tool defs', () => {
-      const tools = buildPanelTools(makeHost());
-      expect(tools.length).toBeGreaterThan(5);
-    });
-
-    it('every tool has name, description, parameters, handler', () => {
-      const tools = buildPanelTools(makeHost());
-      for (const t of tools) {
-        expect(t.name).toBeTruthy();
-        expect(t.description).toBeTruthy();
-        expect(t.parameters).toBeDefined();
-        expect(typeof t.handler).toBe('function');
-      }
-    });
-
-    it('tool names are unique', () => {
-      const tools = buildPanelTools(makeHost());
-      const names = tools.map((t) => t.name);
-      expect(new Set(names).size).toBe(names.length);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Query tools (read-only — no mutates flag)
-  // ---------------------------------------------------------------------------
-
-  describe('query tools', () => {
-    it('get_tracks calls host.getPluginTracks', async () => {
-      const host = makeHost();
-      const tools = buildPanelTools(host);
-      const tool = tools.find((t) => t.name === 'get_tracks')!;
-      await tool.handler({});
-      expect(host.getPluginTracks).toHaveBeenCalled();
-      expect(tool.mutates).not.toBe(true);
-    });
-
-    it('get_musical_context calls host.getMusicalContext', async () => {
-      const host = makeHost();
-      const tools = buildPanelTools(host);
-      const tool = tools.find((t) => t.name === 'get_musical_context')!;
-      await tool.handler({});
-      expect(host.getMusicalContext).toHaveBeenCalled();
-      expect(tool.mutates).not.toBe(true);
-    });
-
-    it('get_track_fx_state calls host.getTrackFxState with trackId', async () => {
-      const host = makeHost();
-      const tools = buildPanelTools(host);
-      const tool = tools.find((t) => t.name === 'get_track_fx_state')!;
-      await tool.handler({ trackId: 't-1' });
-      expect(host.getTrackFxState).toHaveBeenCalledWith('t-1');
-      expect(tool.mutates).not.toBe(true);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Track-control tools (mutates)
-  // ---------------------------------------------------------------------------
-
-  describe('track control — mutating', () => {
-    const cases: Array<[string, string, Record<string, unknown>, unknown[]]> = [
-      ['set_track_mute', 'setTrackMute', { trackId: 't-1', muted: true }, ['t-1', true]],
-      ['set_track_solo', 'setTrackSolo', { trackId: 't-1', soloed: true }, ['t-1', true]],
-      ['set_track_volume', 'setTrackVolume', { trackId: 't-1', volume: 0.5 }, ['t-1', 0.5]],
-      ['set_track_pan', 'setTrackPan', { trackId: 't-1', pan: -0.5 }, ['t-1', -0.5]],
-    ];
-    it.each(cases)(
-      '%s dispatches to host.%s and is flagged mutates',
-      async (toolName, hostMethod, params, expectedArgs) => {
-        const host = makeHost();
-        const tools = buildPanelTools(host);
-        const tool = tools.find((t) => t.name === toolName)!;
-
-        await tool.handler(params);
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        expect((host as unknown as Record<string, jest.Mock<any>>)[hostMethod])
-          .toHaveBeenCalledWith(...expectedArgs);
-        expect(tool.mutates).toBe(true);
-      }
-    );
-  });
-
-  // ---------------------------------------------------------------------------
-  // FX tools (mutates)
-  // ---------------------------------------------------------------------------
-
-  describe('FX tools — mutating', () => {
-    it('toggle_track_fx dispatches and is mutating', async () => {
-      const host = makeHost();
-      const tool = buildPanelTools(host).find((t) => t.name === 'toggle_track_fx')!;
-      await tool.handler({ trackId: 't-1', category: 'reverb', enabled: true });
-      expect(host.toggleTrackFx).toHaveBeenCalledWith('t-1', 'reverb', true);
-      expect(tool.mutates).toBe(true);
-    });
-
-    it('set_track_fx_preset dispatches and is mutating', async () => {
-      const host = makeHost();
-      const tool = buildPanelTools(host).find((t) => t.name === 'set_track_fx_preset')!;
-      await tool.handler({ trackId: 't-1', category: 'reverb', preset: 3 });
-      expect(host.setTrackFxPreset).toHaveBeenCalledWith('t-1', 'reverb', 3);
-      expect(tool.mutates).toBe(true);
-    });
-
-    it('set_track_fx_dry_wet dispatches and is mutating', async () => {
-      const host = makeHost();
-      const tool = buildPanelTools(host).find((t) => t.name === 'set_track_fx_dry_wet')!;
-      await tool.handler({ trackId: 't-1', category: 'reverb', dryWet: 0.4 });
-      expect(host.setTrackFxDryWet).toHaveBeenCalledWith('t-1', 'reverb', 0.4);
-      expect(tool.mutates).toBe(true);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Lifecycle tools
-  // ---------------------------------------------------------------------------
-
-  describe('lifecycle — mutating', () => {
-    it('delete_track dispatches and is mutating', async () => {
-      const host = makeHost();
-      const tool = buildPanelTools(host).find((t) => t.name === 'delete_track')!;
-      await tool.handler({ trackId: 't-1' });
-      expect(host.deleteTrack).toHaveBeenCalledWith('t-1');
-      expect(tool.mutates).toBe(true);
-    });
-
-    it('shuffle_preset dispatches and is mutating (it changes track audio)', async () => {
-      const host = makeHost();
-      const tool = buildPanelTools(host).find((t) => t.name === 'shuffle_preset')!;
-      await tool.handler({ trackId: 't-1' });
-      expect(host.shufflePreset).toHaveBeenCalledWith('t-1');
-      expect(tool.mutates).toBe(true);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Return values bubble up
-  // ---------------------------------------------------------------------------
-
-  describe('return values', () => {
-    it('get_tracks returns whatever host returned', async () => {
+    it('returns one ChatAgentTool per app tool the host advertises', async () => {
       const host = makeHost({
-        getPluginTracks: jest.fn<any>().mockResolvedValue([{ id: 't-1', displayName: 'Bass' }]),
+        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
       });
-      const tool = buildPanelTools(host).find((t) => t.name === 'get_tracks')!;
+      const tools = await buildPanelTools(host);
+      expect(tools).toHaveLength(3);
+      expect(tools.map((t) => t.name)).toEqual([
+        'scene_get_tracks',
+        'dsl_play',
+        'dsl_track_mute',
+      ]);
+    });
+
+    it('requests scene-scoped tools only', async () => {
+      const host = makeHost({
+        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
+      });
+      await buildPanelTools(host);
+      expect(host.listAppTools).toHaveBeenCalledWith({ scope: 'scene' });
+    });
+
+    it('forwards description, input schema, and mutates=true on each tool', async () => {
+      const host = makeHost({
+        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
+      });
+      const tools = await buildPanelTools(host);
+      for (let i = 0; i < tools.length; i++) {
+        expect(tools[i].name).toBe(SAMPLE_TOOLS[i].name);
+        expect(tools[i].description).toBe(SAMPLE_TOOLS[i].description);
+        expect(tools[i].parameters.type).toBe('object');
+        expect(tools[i].mutates).toBe(true);
+      }
+    });
+  });
+
+  describe('handler behavior', () => {
+    it('calls host.executeAppTool with the tool name and params', async () => {
+      const executeAppTool = jest
+        .fn<any>()
+        .mockResolvedValue({ success: true, action: 'dsl_track_mute', data: { ok: true } });
+      const host = makeHost({
+        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
+        executeAppTool,
+      });
+      const tools = await buildPanelTools(host);
+      const muteTool = tools.find((t) => t.name === 'dsl_track_mute')!;
+
+      await muteTool.handler({ trackId: 't-1', muted: true });
+
+      expect(executeAppTool).toHaveBeenCalledWith('dsl_track_mute', {
+        trackId: 't-1',
+        muted: true,
+      });
+    });
+
+    it('returns the result data on success', async () => {
+      const host = makeHost({
+        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
+        executeAppTool: jest.fn<any>().mockResolvedValue({
+          success: true,
+          action: 'scene_get_tracks',
+          data: { tracks: [{ id: 't1', name: 'Bass' }] },
+        }),
+      });
+      const tool = (await buildPanelTools(host)).find((t) => t.name === 'scene_get_tracks')!;
       const result = await tool.handler({});
-      expect(result).toEqual([{ id: 't-1', displayName: 'Bass' }]);
+      expect(result).toEqual({ tracks: [{ id: 't1', name: 'Bass' }] });
+    });
+
+    it('falls back to { ok: true } when the tool returns no data payload', async () => {
+      const host = makeHost({
+        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
+        executeAppTool: jest.fn<any>().mockResolvedValue({
+          success: true,
+          action: 'dsl_play',
+          // no data
+        }),
+      });
+      const tool = (await buildPanelTools(host)).find((t) => t.name === 'dsl_play')!;
+      const result = await tool.handler({});
+      expect(result).toEqual({ ok: true });
+    });
+
+    it('throws when the tool fails so the agent loop captures the error', async () => {
+      const host = makeHost({
+        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
+        executeAppTool: jest.fn<any>().mockResolvedValue({
+          success: false,
+          action: 'dsl_play',
+          error: 'no scene active',
+        }),
+      });
+      const tool = (await buildPanelTools(host)).find((t) => t.name === 'dsl_play')!;
+      await expect(tool.handler({})).rejects.toThrow(/no scene active/);
     });
   });
 });
 
 describe('buildSceneContextSnapshot', () => {
-  it('returns a short human-readable string summarizing scene state', async () => {
-    const host = makeHost({
-      getPluginTracks: jest.fn<any>().mockResolvedValue([
-        { id: 't-1', displayName: 'Bass', role: 'bass' },
-        { id: 't-2', displayName: 'Drums', role: 'drums' },
-      ]),
-      getMusicalContext: jest.fn<any>().mockResolvedValue({ key: 'A minor', bpm: 90 }),
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  function hostForSnapshot(
+    tracksResult: PanelAppToolResult,
+    ctxResult: PanelAppToolResult
+  ): PanelHost {
+    const executeAppTool = jest.fn<any>().mockImplementation((name: string) => {
+      if (name === 'scene_get_tracks') return Promise.resolve(tracksResult);
+      if (name === 'get_musical_context') return Promise.resolve(ctxResult);
+      return Promise.resolve({ success: false, action: name, error: 'unexpected' });
     });
+    return {
+      listAppTools: jest.fn<any>().mockResolvedValue([]),
+      executeAppTool,
+    } as unknown as PanelHost;
+  }
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  it('summarizes scene state as a human-readable string', async () => {
+    const host = hostForSnapshot(
+      {
+        success: true,
+        action: 'scene_get_tracks',
+        data: {
+          tracks: [
+            { id: 't-1', name: 'Bass', role: 'bass' },
+            { id: 't-2', name: 'Drums', role: 'drums' },
+          ],
+        },
+      },
+      { success: true, action: 'get_musical_context', data: { key: 'A minor', bpm: 90 } }
+    );
 
     const snapshot = await buildSceneContextSnapshot(host);
     expect(snapshot).toContain('A minor');
@@ -209,20 +197,21 @@ describe('buildSceneContextSnapshot', () => {
     expect(snapshot).toContain('Drums');
   });
 
-  it('degrades gracefully if host methods throw', async () => {
-    const host = makeHost({
-      getPluginTracks: jest.fn<any>().mockRejectedValue(new Error('boom')),
-    });
+  it('reports "empty" when scene has no tracks', async () => {
+    const host = hostForSnapshot(
+      { success: true, action: 'scene_get_tracks', data: { tracks: [] } },
+      { success: true, action: 'get_musical_context', data: { key: 'C', bpm: 120 } }
+    );
     const snapshot = await buildSceneContextSnapshot(host);
-    // Should still return a string (not throw) so the agent can proceed
-    expect(typeof snapshot).toBe('string');
+    expect(snapshot).toMatch(/empty|no tracks/i);
   });
 
-  it('reports "no tracks" when the scene is empty', async () => {
-    const host = makeHost({
-      getPluginTracks: jest.fn<any>().mockResolvedValue([]),
-    });
+  it('degrades gracefully when a tool fails', async () => {
+    const host = hostForSnapshot(
+      { success: false, action: 'scene_get_tracks', error: 'no project' },
+      { success: false, action: 'get_musical_context', error: 'no project' }
+    );
     const snapshot = await buildSceneContextSnapshot(host);
-    expect(snapshot).toMatch(/no tracks|empty/i);
+    expect(typeof snapshot).toBe('string');
   });
 });
