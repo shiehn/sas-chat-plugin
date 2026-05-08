@@ -215,4 +215,160 @@ describe('buildPanelTools', () => {
       })
     );
   });
+
+  describe('schema sanitization (Gemini compatibility)', () => {
+    it('strips registry-only extension fields (canonical, aliases) from properties', async () => {
+      const host = {
+        listAppTools: jest.fn().mockResolvedValue([
+          {
+            name: 'make_beat',
+            description: 'Make a beat',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                bpm: {
+                  type: 'integer',
+                  description: 'Beats per minute',
+                  // Registry's input-alias normalizer attaches these:
+                  canonical: 'bpm',
+                  aliases: ['tempo', 'beats_per_minute'],
+                },
+              },
+              required: ['bpm'],
+            },
+            scope: 'scene',
+          },
+        ]),
+        getActiveSceneId: jest.fn().mockReturnValue(null),
+      };
+
+      const result = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const decl = result.tools[0].functionDeclarations[0];
+      const bpm = (decl.parameters.properties as Record<string, Record<string, unknown>>)
+        .bpm;
+      expect(bpm).toEqual({ type: 'integer', description: 'Beats per minute' });
+      expect(bpm).not.toHaveProperty('canonical');
+      expect(bpm).not.toHaveProperty('aliases');
+    });
+
+    it('stringifies non-string enum values and forces type to string', async () => {
+      const host = {
+        listAppTools: jest.fn().mockResolvedValue([
+          {
+            name: 'set_bars',
+            description: 'Set bar count',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                bars: {
+                  type: 'integer',
+                  enum: [2, 4, 8, 16],
+                  description: 'Bar count',
+                },
+              },
+              required: ['bars'],
+            },
+            scope: 'scene',
+          },
+        ]),
+        getActiveSceneId: jest.fn().mockReturnValue(null),
+      };
+
+      const result = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const decl = result.tools[0].functionDeclarations[0];
+      const bars = (decl.parameters.properties as Record<string, Record<string, unknown>>)
+        .bars;
+      expect(bars.type).toBe('string');
+      expect(bars.enum).toEqual(['2', '4', '8', '16']);
+      expect(bars.description).toBe('Bar count');
+    });
+
+    it('preserves string enums + their declared type', async () => {
+      const host = {
+        listAppTools: jest.fn().mockResolvedValue([
+          {
+            name: 'set_role',
+            description: 'Pick a role',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                role: {
+                  type: 'string',
+                  enum: ['bass', 'drums', 'lead'],
+                },
+              },
+            },
+            scope: 'scene',
+          },
+        ]),
+        getActiveSceneId: jest.fn().mockReturnValue(null),
+      };
+
+      const result = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const decl = result.tools[0].functionDeclarations[0];
+      const role = (decl.parameters.properties as Record<string, Record<string, unknown>>)
+        .role;
+      expect(role.type).toBe('string');
+      expect(role.enum).toEqual(['bass', 'drums', 'lead']);
+    });
+
+    it('recurses into nested object properties and array items', async () => {
+      const host = {
+        listAppTools: jest.fn().mockResolvedValue([
+          {
+            name: 'compose_scene',
+            description: 'Compose a scene',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                tracks: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      role: { type: 'string', canonical: 'role', aliases: ['kind'] },
+                      bars: { type: 'integer', enum: [2, 4, 8] },
+                    },
+                  },
+                },
+              },
+            },
+            scope: 'scene',
+          },
+        ]),
+        getActiveSceneId: jest.fn().mockReturnValue(null),
+      };
+
+      const result = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const decl = result.tools[0].functionDeclarations[0];
+      const tracks = (decl.parameters.properties as Record<string, Record<string, unknown>>)
+        .tracks as { items: { properties: Record<string, Record<string, unknown>> } };
+
+      // canonical/aliases stripped from the nested role
+      expect(tracks.items.properties.role).toEqual({ type: 'string' });
+      // integer enum coerced inside the array's items
+      expect(tracks.items.properties.bars.type).toBe('string');
+      expect(tracks.items.properties.bars.enum).toEqual(['2', '4', '8']);
+    });
+  });
 });

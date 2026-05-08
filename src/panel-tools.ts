@@ -91,13 +91,15 @@ export async function buildPanelTools(
 // ---------------------------------------------------------------------------
 
 function toFunctionDeclaration(tool: PluginAppTool): LLMFunctionDeclaration {
-  // The host emits JSON Schema in `inputSchema`. Gemini accepts a deliberate
-  // subset; the shape is compatible enough to pass through verbatim. If
-  // properties is undefined, surface an empty object so Gemini doesn't
-  // reject the declaration.
-  const properties = isRecord(tool.inputSchema.properties)
+  // The host emits JSON Schema in `inputSchema`. Gemini's tool schema is a
+  // STRICT OpenAPI subset — it rejects unknown fields (e.g. the registry's
+  // `canonical` / `aliases` extensions added by the input-alias normalizer)
+  // and only accepts `enum` on STRING-typed properties. Sanitize before
+  // forwarding.
+  const rawProperties = isRecord(tool.inputSchema.properties)
     ? tool.inputSchema.properties
     : {};
+  const properties = sanitizeProperties(rawProperties);
   return {
     name: tool.name,
     description: tool.description,
@@ -107,6 +109,75 @@ function toFunctionDeclaration(tool: PluginAppTool): LLMFunctionDeclaration {
       required: tool.inputSchema.required,
     },
   };
+}
+
+/**
+ * Allow-list of property fields Gemini accepts on a Schema. Anything else
+ * (e.g. `canonical`, `aliases`, `$schema`, `additionalProperties`) is
+ * silently dropped. The registry attaches these for CLI normalization;
+ * the LLM doesn't need them.
+ */
+const GEMINI_SCHEMA_FIELDS = new Set([
+  'type',
+  'description',
+  'enum',
+  'format',
+  'items',
+  'properties',
+  'required',
+  'nullable',
+  'default',
+  'minimum',
+  'maximum',
+  'minLength',
+  'maxLength',
+  'minItems',
+  'maxItems',
+]);
+
+function sanitizeProperties(
+  properties: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [name, schema] of Object.entries(properties)) {
+    out[name] = sanitizeSchema(schema);
+  }
+  return out;
+}
+
+function sanitizeSchema(schema: unknown): unknown {
+  if (!isRecord(schema)) return schema;
+
+  const out: Record<string, unknown> = {};
+  let forceStringType = false;
+
+  for (const [key, value] of Object.entries(schema)) {
+    if (!GEMINI_SCHEMA_FIELDS.has(key)) continue;
+
+    if (key === 'properties' && isRecord(value)) {
+      out[key] = sanitizeProperties(value);
+    } else if (key === 'items') {
+      out[key] = sanitizeSchema(value);
+    } else if (key === 'enum' && Array.isArray(value)) {
+      // Gemini only accepts `enum` on STRING-typed schemas. If any entry
+      // is non-string (common: bar counts as integers), stringify all of
+      // them and force the type to "string". The CLI's input-alias
+      // normalizer already coerces incoming values, so the LLM passing
+      // "4" instead of 4 round-trips correctly.
+      const allStrings = value.every((v) => typeof v === 'string');
+      if (allStrings) {
+        out.enum = value;
+      } else {
+        out.enum = value.map((v) => String(v));
+        forceStringType = true;
+      }
+    } else {
+      out[key] = value;
+    }
+  }
+
+  if (forceStringType) out.type = 'string';
+  return out;
 }
 
 function injectActiveSceneId(
