@@ -18,13 +18,19 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { InputBox } from './InputBox';
 import { TerminalLog } from './TerminalLog';
 import type { TerminalEntry } from './types';
-import type { AgentResponse, ChatAgentEvent } from '../chat-agent';
+import type { AgentLoopEvent } from '../agent-loop';
+
+/** Final response shape returned by the renderer-side bridge. */
+export interface ChatPanelResponse {
+  text: string;
+  actions: AgentLoopEvent[];
+}
 
 export interface ChatPanelProps {
   sendMessage: (
     message: string,
-    onEvent: (event: ChatAgentEvent) => void
-  ) => Promise<AgentResponse>;
+    onEvent: (event: AgentLoopEvent) => void
+  ) => Promise<ChatPanelResponse>;
   initialEntries?: TerminalEntry[];
   registerReset?: (reset: () => void) => void;
 }
@@ -98,7 +104,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       setEntries((prev) => [...prev, userEntry]);
       setIsProcessing(true);
 
-      const onEvent = (event: ChatAgentEvent): void => {
+      const onEvent = (event: AgentLoopEvent): void => {
         setEntries((prev) => applyEvent(prev, event, turnId));
       };
 
@@ -150,7 +156,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
 function applyEvent(
   entries: TerminalEntry[],
-  event: ChatAgentEvent,
+  event: AgentLoopEvent,
   turnId: number
 ): TerminalEntry[] {
   switch (event.type) {
@@ -162,12 +168,24 @@ function applyEvent(
           id: nextId(),
           turnId,
           callId: event.callId,
-          tool: event.tool,
-          params: event.params,
+          tool: event.toolName,
+          params: event.toolArgs,
         },
       ];
 
-    case 'tool_call_done':
+    case 'tool_call_done': {
+      // The agent loop returns a structured `ToolExecutionResult` for both
+      // success and failure (it only feeds back synthetic failures when the
+      // subprocess truly couldn't run). We map success → `result` (the
+      // captured stdout) and non-success → `error` (stderr). The terminal
+      // entry shape predates this and uses both fields side-by-side.
+      const isFailure = !event.result.success;
+      const errorText =
+        event.result.stderr.length > 0
+          ? event.result.stderr
+          : event.result.stdout.length > 0
+            ? event.result.stdout
+            : `Tool exited with code ${event.result.exitCode}`;
       return entries.map((e) =>
         e.kind === 'tool_pending' &&
         e.turnId === turnId &&
@@ -177,13 +195,14 @@ function applyEvent(
               id: e.id,
               turnId,
               callId: event.callId,
-              tool: event.tool,
-              params: event.params,
-              result: event.result,
-              error: event.error,
+              tool: event.toolName,
+              params: event.toolArgs,
+              result: isFailure ? undefined : event.result.stdout,
+              error: isFailure ? errorText : undefined,
             }
           : e
       );
+    }
 
     case 'final_text': {
       const toolCount = entries.filter(
@@ -197,7 +216,7 @@ function applyEvent(
           kind: 'assistant',
           id: nextId(),
           turnId,
-          text: event.content,
+          text: event.text,
           toolCount,
           collapsed: false,
         },

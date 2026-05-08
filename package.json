@@ -1,7 +1,7 @@
 {
   "name": "@signalsandsorcery/chat-plugin",
-  "version": "1.0.0",
-  "description": "Chat panel plugin for Signals & Sorcery — AI-powered scene-scoped audio manipulation via natural language.",
+  "version": "2.0.0",
+  "description": "Chat panel plugin for Signals & Sorcery — drives the sas CLI like Claude Code at the terminal. Native Gemini function-calling, scene-scoped, agentic recovery from CLI errors.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",

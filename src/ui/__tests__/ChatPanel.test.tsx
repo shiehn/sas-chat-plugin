@@ -1,28 +1,64 @@
 /**
  * ChatPanel spec — terminal-log behavior.
  *
- * The ChatPanel subscribes to ChatAgentEvents while sendMessage is in
- * flight. Each event mutates the running log: tool_call_start inserts a
- * pending row, tool_call_done replaces it with a result row, final_text
- * appends the assistant line. After the turn completes, tool rows collapse
- * to a one-line summary that can be re-expanded.
+ * The ChatPanel subscribes to AgentLoopEvents while sendMessage is in flight.
+ * Each event mutates the running log: tool_call_start inserts a pending row,
+ * tool_call_done replaces it with a result row, final_text appends the
+ * assistant line. After the turn completes, tool rows collapse to a one-line
+ * summary that can be re-expanded.
  */
 
 import React from 'react';
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
-import { ChatPanel } from '../ChatPanel';
-import type { AgentResponse, ChatAgentEvent } from '../../chat-agent';
+import { ChatPanel, type ChatPanelResponse } from '../ChatPanel';
+import type { AgentLoopEvent } from '../../agent-loop';
 
 type SendFn = (
   message: string,
-  onEvent: (event: ChatAgentEvent) => void
-) => Promise<AgentResponse>;
+  onEvent: (event: AgentLoopEvent) => void
+) => Promise<ChatPanelResponse>;
 
 function typeAndSend(text: string): void {
   const textarea = screen.getByRole('textbox');
   fireEvent.change(textarea, { target: { value: text } });
   fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter' });
+}
+
+/** Helper: build a tool_call_done success event with stdout JSON. */
+function toolDoneSuccess(
+  iteration: number,
+  callId: string,
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+  stdout: string
+): AgentLoopEvent {
+  return {
+    type: 'tool_call_done',
+    iteration,
+    callId,
+    toolName,
+    toolArgs,
+    result: { success: true, exitCode: 0, stdout, stderr: '' },
+  };
+}
+
+/** Helper: build a tool_call_done failure event with stderr text. */
+function toolDoneFailure(
+  iteration: number,
+  callId: string,
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+  stderr: string
+): AgentLoopEvent {
+  return {
+    type: 'tool_call_done',
+    iteration,
+    callId,
+    toolName,
+    toolArgs,
+    result: { success: false, exitCode: 1, stdout: '', stderr },
+  };
 }
 
 describe('ChatPanel (terminal log)', () => {
@@ -35,7 +71,7 @@ describe('ChatPanel (terminal log)', () => {
   describe('basic flow', () => {
     it('renders user prompt and final assistant text', async () => {
       sendFn.mockImplementation(async (_msg, onEvent) => {
-        onEvent({ type: 'final_text', content: 'Hello back.' });
+        onEvent({ type: 'final_text', iterations: 1, text: 'Hello back.' });
         return { text: 'Hello back.', actions: [] };
       });
       render(<ChatPanel sendMessage={sendFn} />);
@@ -51,26 +87,27 @@ describe('ChatPanel (terminal log)', () => {
 
     it('clears the input after send', async () => {
       sendFn.mockImplementation(async (_msg, onEvent) => {
-        onEvent({ type: 'final_text', content: 'ok' });
+        onEvent({ type: 'final_text', iterations: 1, text: 'ok' });
         return { text: 'ok', actions: [] };
       });
       render(<ChatPanel sendMessage={sendFn} />);
 
       const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
       await act(async () => {
-        typeAndSend('x');
+        typeAndSend('hi');
       });
+
       expect(textarea.value).toBe('');
     });
   });
 
   describe('tool streaming', () => {
     it('renders a pending tool row on tool_call_start and fills in the result on tool_call_done', async () => {
-      let capturedOnEvent: (e: ChatAgentEvent) => void = () => {};
-      let resolveSend: (v: AgentResponse) => void = () => {};
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
       sendFn.mockImplementation(
         (_msg, onEvent) =>
-          new Promise<AgentResponse>((resolve) => {
+          new Promise<ChatPanelResponse>((resolve) => {
             capturedOnEvent = onEvent;
             resolveSend = resolve;
           })
@@ -88,8 +125,8 @@ describe('ChatPanel (terminal log)', () => {
           type: 'tool_call_start',
           iteration: 1,
           callId: 'c1',
-          tool: 'get_tracks',
-          params: {},
+          toolName: 'get_tracks',
+          toolArgs: {},
         });
       });
       expect(screen.getByText('get_tracks')).not.toBeNull();
@@ -98,21 +135,16 @@ describe('ChatPanel (terminal log)', () => {
 
       // Result arrives — ↳ line appears with a formatted result
       act(() => {
-        capturedOnEvent({
-          type: 'tool_call_done',
-          iteration: 1,
-          callId: 'c1',
-          tool: 'get_tracks',
-          params: {},
-          result: { tracks: ['Bass', 'Drums'] },
-        });
+        capturedOnEvent(
+          toolDoneSuccess(1, 'c1', 'get_tracks', {}, JSON.stringify({ tracks: ['Bass', 'Drums'] }))
+        );
       });
       expect(screen.getByText(/↳/)).not.toBeNull();
       expect(screen.getByText(/Bass/)).not.toBeNull();
 
       // Finish the turn
       act(() => {
-        capturedOnEvent({ type: 'final_text', content: 'Found 2.' });
+        capturedOnEvent({ type: 'final_text', iterations: 1, text: 'Found 2.' });
       });
       await act(async () => {
         resolveSend({ text: 'Found 2.', actions: [] });
@@ -125,18 +157,11 @@ describe('ChatPanel (terminal log)', () => {
           type: 'tool_call_start',
           iteration: 1,
           callId: 'c1',
-          tool: 'bad',
-          params: {},
+          toolName: 'bad',
+          toolArgs: {},
         });
-        onEvent({
-          type: 'tool_call_done',
-          iteration: 1,
-          callId: 'c1',
-          tool: 'bad',
-          params: {},
-          error: 'track not found',
-        });
-        onEvent({ type: 'final_text', content: 'Could not find it.' });
+        onEvent(toolDoneFailure(1, 'c1', 'bad', {}, 'track not found'));
+        onEvent({ type: 'final_text', iterations: 1, text: 'Could not find it.' });
         return { text: 'Could not find it.', actions: [] };
       });
 
@@ -156,33 +181,19 @@ describe('ChatPanel (terminal log)', () => {
           type: 'tool_call_start',
           iteration: 1,
           callId: 'c1',
-          tool: 'get_tracks',
-          params: {},
+          toolName: 'get_tracks',
+          toolArgs: {},
         });
-        onEvent({
-          type: 'tool_call_done',
-          iteration: 1,
-          callId: 'c1',
-          tool: 'get_tracks',
-          params: {},
-          result: { tracks: ['Bass'] },
-        });
+        onEvent(toolDoneSuccess(1, 'c1', 'get_tracks', {}, JSON.stringify({ tracks: ['Bass'] })));
         onEvent({
           type: 'tool_call_start',
           iteration: 2,
           callId: 'c2',
-          tool: 'set_fx',
-          params: { enabled: true },
+          toolName: 'set_fx',
+          toolArgs: { enabled: true },
         });
-        onEvent({
-          type: 'tool_call_done',
-          iteration: 2,
-          callId: 'c2',
-          tool: 'set_fx',
-          params: { enabled: true },
-          result: null,
-        });
-        onEvent({ type: 'final_text', content: 'Done.' });
+        onEvent(toolDoneSuccess(2, 'c2', 'set_fx', { enabled: true }, ''));
+        onEvent({ type: 'final_text', iterations: 2, text: 'Done.' });
         return { text: 'Done.', actions: [] };
       });
 
@@ -206,18 +217,11 @@ describe('ChatPanel (terminal log)', () => {
           type: 'tool_call_start',
           iteration: 1,
           callId: 'c1',
-          tool: 'get_tracks',
-          params: {},
+          toolName: 'get_tracks',
+          toolArgs: {},
         });
-        onEvent({
-          type: 'tool_call_done',
-          iteration: 1,
-          callId: 'c1',
-          tool: 'get_tracks',
-          params: {},
-          result: null,
-        });
-        onEvent({ type: 'final_text', content: 'Done.' });
+        onEvent(toolDoneSuccess(1, 'c1', 'get_tracks', {}, ''));
+        onEvent({ type: 'final_text', iterations: 1, text: 'Done.' });
         return { text: 'Done.', actions: [] };
       });
 
@@ -240,7 +244,7 @@ describe('ChatPanel (terminal log)', () => {
 
     it('does not show a summary when the turn had zero tool calls', async () => {
       sendFn.mockImplementation(async (_msg, onEvent) => {
-        onEvent({ type: 'final_text', content: 'just talking' });
+        onEvent({ type: 'final_text', iterations: 1, text: 'just talking' });
         return { text: 'just talking', actions: [] };
       });
 
@@ -256,9 +260,9 @@ describe('ChatPanel (terminal log)', () => {
 
   describe('processing state', () => {
     it('disables input while a turn is in flight', async () => {
-      let resolveSend: (v: AgentResponse) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
       sendFn.mockImplementation(
-        () => new Promise<AgentResponse>((resolve) => { resolveSend = resolve; })
+        () => new Promise<ChatPanelResponse>((resolve) => { resolveSend = resolve; })
       );
       render(<ChatPanel sendMessage={sendFn} />);
 
@@ -295,11 +299,11 @@ describe('ChatPanel (terminal log)', () => {
     it('keeps prior turns visible', async () => {
       sendFn
         .mockImplementationOnce(async (_msg, onEvent) => {
-          onEvent({ type: 'final_text', content: 'one' });
+          onEvent({ type: 'final_text', iterations: 1, text: 'one' });
           return { text: 'one', actions: [] };
         })
         .mockImplementationOnce(async (_msg, onEvent) => {
-          onEvent({ type: 'final_text', content: 'two' });
+          onEvent({ type: 'final_text', iterations: 1, text: 'two' });
           return { text: 'two', actions: [] };
         });
 
@@ -322,7 +326,7 @@ describe('ChatPanel (terminal log)', () => {
     it('clears the log when the registered reset callback is invoked', async () => {
       let doReset: (() => void) | null = null;
       sendFn.mockImplementation(async (_msg, onEvent) => {
-        onEvent({ type: 'final_text', content: 'ok' });
+        onEvent({ type: 'final_text', iterations: 1, text: 'ok' });
         return { text: 'ok', actions: [] };
       });
 
@@ -355,20 +359,13 @@ describe('ChatPanel (terminal log)', () => {
           type: 'tool_call_start',
           iteration: 1,
           callId: 'c1',
-          tool: 'noop',
-          params: {},
+          toolName: 'noop',
+          toolArgs: {},
         });
-        onEvent({
-          type: 'tool_call_done',
-          iteration: 1,
-          callId: 'c1',
-          tool: 'noop',
-          params: {},
-          result: null,
-        });
-        onEvent({ type: 'final_text', content: 'hit the cap' });
-        onEvent({ type: 'iteration_limit' });
-        return { text: 'hit the cap', actions: [], iterationLimitHit: true };
+        onEvent(toolDoneSuccess(1, 'c1', 'noop', {}, ''));
+        onEvent({ type: 'final_text', iterations: 1, text: 'hit the cap' });
+        onEvent({ type: 'iteration_limit', iterations: 1 });
+        return { text: 'hit the cap', actions: [] };
       });
 
       render(<ChatPanel sendMessage={sendFn} />);

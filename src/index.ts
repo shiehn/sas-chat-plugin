@@ -1,40 +1,37 @@
 /**
  * @signalsandsorcery/chat-panel — Built-in Chat Panel Plugin
  *
- * AI-powered scene-scoped audio manipulation via natural language.
- * Follows the GeneratorPlugin convention like every other built-in
- * (synth-generator, sample-player, audio-texture).
+ * AI-powered scene-scoped audio manipulation via natural language. The user
+ * types a request, and the agent loop drives the `sas` CLI iteratively until
+ * it achieves the goal — same surface external agents (Claude Code, Cursor)
+ * use at the terminal.
  *
- * Architecture (Section 14–15 of docs-ai-planning/ai-orchestration-design.md):
+ * Architecture:
  *
  *   plugin.tsx          GeneratorPlugin class — lifecycle, UI, skills
- *   chat-agent.ts       Agentic tool loop (LLM ↔ tools, reinforcement injection)
- *   llm-adapter.ts      PluginHost.generateWithLLM ↔ ChatAgent.LLMCallFn bridge
- *   panel-tools.ts      PluginHost methods as ChatAgentTool definitions
+ *   agent-loop.ts       Native-tool-use loop (Gemini function-calling)
+ *   sas-tool-handler.ts Spawns the `sas` CLI subprocess for each tool call
+ *   panel-tools.ts      Maps host.listAppTools() → LLMTool[] + executor
  */
 
 export { ChatPanelPlugin, CHAT_PANEL_PLUGIN_ID } from './plugin';
-export type { ChatInvocation } from './plugin';
+export type { ChatInvocation, ChatResponse } from './plugin';
 
-export { ChatAgent } from './chat-agent';
+export { AgentLoop } from './agent-loop';
 export type {
-  ChatAgentTool,
-  ChatAgentOptions,
-  AgentResponse,
-  ActionLogEntry,
-  ChatAgentEvent,
-  ChatAgentEventHandler,
-  LLMCallFn,
-  LLMRequest,
-  LLMResponse,
-  LLMMessage,
-} from './chat-agent';
+  AgentLoopOptions,
+  AgentLoopResult,
+  AgentLoopEvent,
+  AgentLoopEventHandler,
+  ToolExecutor,
+  ToolExecutionResult,
+} from './agent-loop';
 
-export { makeLLMAdapter } from './llm-adapter';
-export type { PluginHostLLMFn, PluginHostLLMRequest, PluginHostLLMResult } from './llm-adapter';
+export { invokeSas } from './sas-tool-handler';
+export type { SasToolInvocation, SasToolResult } from './sas-tool-handler';
 
-export { buildPanelTools, buildSceneContextSnapshot } from './panel-tools';
-export type { PanelHost } from './panel-tools';
+export { buildPanelTools } from './panel-tools';
+export type { PanelTools } from './panel-tools';
 
 export { default } from './plugin';
 

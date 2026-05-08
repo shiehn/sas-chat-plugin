@@ -1,217 +1,218 @@
 /**
- * panel-tools spec — delegates to the host's app-tool bridge.
+ * Tests for buildPanelTools — discovery + sceneId injection + executor wiring.
  *
- * After the 1.3.0 SDK refactor, panel-tools stopped hand-wiring individual
- * PluginHost methods. Instead it asks the host for every scene-scoped app
- * tool via `host.listAppTools({ scope: 'scene' })` and wraps each as a
- * `ChatAgentTool` whose handler calls `host.executeAppTool`.
- *
- * Tests verify:
- *   - buildPanelTools returns one ChatAgentTool per app tool
- *   - every tool is flagged `mutates: true`
- *   - handlers delegate to `host.executeAppTool(name, params)` and unwrap
- *     `.data` on success / throw on failure
- *   - buildSceneContextSnapshot composes a readable string from the bridge
+ * `invokeSas` is mocked so we can assert the executor would call the right
+ * action with the right (sceneId-injected) params, without actually
+ * spawning a subprocess.
  */
 
-import { describe, it, expect, jest } from '@jest/globals';
-import { buildPanelTools, buildSceneContextSnapshot } from '../panel-tools';
-import type { PanelHost, PanelAppTool, PanelAppToolResult } from '../panel-tools';
+import { buildPanelTools } from '../panel-tools';
+import * as toolHandler from '../sas-tool-handler';
+import type { PluginAppTool } from '@signalsandsorcery/plugin-sdk';
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-function makeHost(overrides: Partial<PanelHost> = {}): PanelHost {
-  const listAppTools = jest.fn<any>().mockResolvedValue([]);
-  const executeAppTool = jest.fn<any>().mockResolvedValue({
-    success: true,
-    action: 'noop',
-    data: null,
-  });
-  return { listAppTools, executeAppTool, ...overrides } as unknown as PanelHost;
-}
+jest.mock('../sas-tool-handler', () => ({
+  invokeSas: jest.fn(),
+}));
 
-const SAMPLE_TOOLS: PanelAppTool[] = [
+const mockInvokeSas = toolHandler.invokeSas as jest.MockedFunction<typeof toolHandler.invokeSas>;
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const SCENE_TOOLS: PluginAppTool[] = [
   {
     name: 'scene_get_tracks',
-    description: 'List tracks in the active scene.',
-    inputSchema: { type: 'object', properties: {} },
-    scope: 'scene',
-  },
-  {
-    name: 'dsl_play',
-    description: 'Start playback.',
-    inputSchema: { type: 'object', properties: {} },
-    scope: 'scene',
-  },
-  {
-    name: 'dsl_track_mute',
-    description: 'Mute a track.',
+    description: 'List tracks in active scene',
     inputSchema: {
       type: 'object',
       properties: {
-        trackId: { type: 'string' },
-        muted: { type: 'boolean' },
+        sceneId: { type: 'string', description: 'Scene UUID' },
       },
+      required: ['sceneId'],
+    },
+    scope: 'scene',
+  },
+  {
+    name: 'transport_play',
+    description: 'Start playback',
+    inputSchema: {
+      type: 'object',
+      properties: {},
     },
     scope: 'scene',
   },
 ];
-/* eslint-enable @typescript-eslint/no-explicit-any */
+
+interface MockHost {
+  listAppTools: jest.Mock;
+  getActiveSceneId: jest.Mock;
+}
+
+function makeHost(activeSceneId: string | null = 'scene-uuid-123'): MockHost {
+  return {
+    listAppTools: jest.fn().mockResolvedValue(SCENE_TOOLS),
+    getActiveSceneId: jest.fn().mockReturnValue(activeSceneId),
+  };
+}
+
+const CLI_PATHS = { appExe: '/fake/Electron', cliEntry: '/fake/dist/cli/sas.js' };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 describe('buildPanelTools', () => {
-  describe('registry shape', () => {
-    it('returns one ChatAgentTool per app tool the host advertises', async () => {
-      const host = makeHost({
-        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
-      });
-      const tools = await buildPanelTools(host);
-      expect(tools).toHaveLength(3);
-      expect(tools.map((t) => t.name)).toEqual([
-        'scene_get_tracks',
-        'dsl_play',
-        'dsl_track_mute',
-      ]);
-    });
-
-    it('requests scene-scoped tools only', async () => {
-      const host = makeHost({
-        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
-      });
-      await buildPanelTools(host);
-      expect(host.listAppTools).toHaveBeenCalledWith({ scope: 'scene' });
-    });
-
-    it('forwards description, input schema, and mutates=true on each tool', async () => {
-      const host = makeHost({
-        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
-      });
-      const tools = await buildPanelTools(host);
-      for (let i = 0; i < tools.length; i++) {
-        expect(tools[i].name).toBe(SAMPLE_TOOLS[i].name);
-        expect(tools[i].description).toBe(SAMPLE_TOOLS[i].description);
-        expect(tools[i].parameters.type).toBe('object');
-        expect(tools[i].mutates).toBe(true);
-      }
+  beforeEach(() => {
+    mockInvokeSas.mockReset();
+    mockInvokeSas.mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      stdout: '{}',
+      stderr: '',
     });
   });
 
-  describe('handler behavior', () => {
-    it('calls host.executeAppTool with the tool name and params', async () => {
-      const executeAppTool = jest
-        .fn<any>()
-        .mockResolvedValue({ success: true, action: 'dsl_track_mute', data: { ok: true } });
-      const host = makeHost({
-        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
-        executeAppTool,
-      });
-      const tools = await buildPanelTools(host);
-      const muteTool = tools.find((t) => t.name === 'dsl_track_mute')!;
+  it('discovers scene-scoped tools and converts them to LLMTool function declarations', async () => {
+    const host = makeHost();
 
-      await muteTool.handler({ trackId: 't-1', muted: true });
-
-      expect(executeAppTool).toHaveBeenCalledWith('dsl_track_mute', {
-        trackId: 't-1',
-        muted: true,
-      });
+    const result = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
     });
 
-    it('returns the result data on success', async () => {
-      const host = makeHost({
-        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
-        executeAppTool: jest.fn<any>().mockResolvedValue({
-          success: true,
-          action: 'scene_get_tracks',
-          data: { tracks: [{ id: 't1', name: 'Bass' }] },
+    expect(host.listAppTools).toHaveBeenCalledWith({ scope: 'scene' });
+    expect(result.tools).toHaveLength(1); // one LLMTool wrapping all decls
+    expect(result.tools[0].functionDeclarations).toHaveLength(2);
+    expect(result.tools[0].functionDeclarations[0]).toEqual(
+      expect.objectContaining({
+        name: 'scene_get_tracks',
+        description: 'List tracks in active scene',
+        parameters: expect.objectContaining({
+          type: 'object',
+          properties: expect.objectContaining({ sceneId: expect.any(Object) }),
+          required: ['sceneId'],
         }),
-      });
-      const tool = (await buildPanelTools(host)).find((t) => t.name === 'scene_get_tracks')!;
-      const result = await tool.handler({});
-      expect(result).toEqual({ tracks: [{ id: 't1', name: 'Bass' }] });
+      })
+    );
+  });
+
+  it('returns an empty tools array when no tools are discovered', async () => {
+    const host = makeHost();
+    host.listAppTools.mockResolvedValueOnce([]);
+
+    const result = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
     });
 
-    it('falls back to { ok: true } when the tool returns no data payload', async () => {
-      const host = makeHost({
-        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
-        executeAppTool: jest.fn<any>().mockResolvedValue({
-          success: true,
-          action: 'dsl_play',
-          // no data
-        }),
-      });
-      const tool = (await buildPanelTools(host)).find((t) => t.name === 'dsl_play')!;
-      const result = await tool.handler({});
-      expect(result).toEqual({ ok: true });
+    expect(result.tools).toEqual([]);
+  });
+
+  it('executor invokes sas CLI with the bare-KV params', async () => {
+    const host = makeHost();
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
     });
 
-    it('throws when the tool fails so the agent loop captures the error', async () => {
-      const host = makeHost({
-        listAppTools: jest.fn<any>().mockResolvedValue(SAMPLE_TOOLS),
-        executeAppTool: jest.fn<any>().mockResolvedValue({
-          success: false,
-          action: 'dsl_play',
-          error: 'no scene active',
-        }),
-      });
-      const tool = (await buildPanelTools(host)).find((t) => t.name === 'dsl_play')!;
-      await expect(tool.handler({})).rejects.toThrow(/no scene active/);
+    await executor('transport_play', { foo: 'bar' });
+
+    expect(mockInvokeSas).toHaveBeenCalledWith({
+      action: 'transport_play',
+      params: { foo: 'bar' },
+      appExe: CLI_PATHS.appExe,
+      cliEntry: CLI_PATHS.cliEntry,
     });
   });
-});
 
-describe('buildSceneContextSnapshot', () => {
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  function hostForSnapshot(
-    tracksResult: PanelAppToolResult,
-    ctxResult: PanelAppToolResult
-  ): PanelHost {
-    const executeAppTool = jest.fn<any>().mockImplementation((name: string) => {
-      if (name === 'scene_get_tracks') return Promise.resolve(tracksResult);
-      if (name === 'get_musical_context') return Promise.resolve(ctxResult);
-      return Promise.resolve({ success: false, action: name, error: 'unexpected' });
+  it('executor injects active sceneId when the tool schema has a sceneId property', async () => {
+    const host = makeHost('active-scene-123');
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
     });
-    return {
-      listAppTools: jest.fn<any>().mockResolvedValue([]),
-      executeAppTool,
-    } as unknown as PanelHost;
-  }
-  /* eslint-enable @typescript-eslint/no-explicit-any */
 
-  it('summarizes scene state as a human-readable string', async () => {
-    const host = hostForSnapshot(
-      {
-        success: true,
+    await executor('scene_get_tracks', {});
+
+    expect(mockInvokeSas).toHaveBeenCalledWith(
+      expect.objectContaining({
         action: 'scene_get_tracks',
-        data: {
-          tracks: [
-            { id: 't-1', name: 'Bass', role: 'bass' },
-            { id: 't-2', name: 'Drums', role: 'drums' },
-          ],
-        },
-      },
-      { success: true, action: 'get_musical_context', data: { key: 'A minor', bpm: 90 } }
+        params: { sceneId: 'active-scene-123' },
+      })
     );
-
-    const snapshot = await buildSceneContextSnapshot(host);
-    expect(snapshot).toContain('A minor');
-    expect(snapshot).toContain('90');
-    expect(snapshot).toContain('Bass');
-    expect(snapshot).toContain('Drums');
   });
 
-  it('reports "empty" when scene has no tracks', async () => {
-    const host = hostForSnapshot(
-      { success: true, action: 'scene_get_tracks', data: { tracks: [] } },
-      { success: true, action: 'get_musical_context', data: { key: 'C', bpm: 120 } }
+  it('executor does NOT override an explicitly-provided sceneId', async () => {
+    const host = makeHost('active-scene-123');
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+
+    await executor('scene_get_tracks', { sceneId: 'caller-explicit-456' });
+
+    expect(mockInvokeSas).toHaveBeenCalledWith(
+      expect.objectContaining({
+        params: { sceneId: 'caller-explicit-456' },
+      })
     );
-    const snapshot = await buildSceneContextSnapshot(host);
-    expect(snapshot).toMatch(/empty|no tracks/i);
   });
 
-  it('degrades gracefully when a tool fails', async () => {
-    const host = hostForSnapshot(
-      { success: false, action: 'scene_get_tracks', error: 'no project' },
-      { success: false, action: 'get_musical_context', error: 'no project' }
+  it('executor does not inject sceneId when the tool has no sceneId property', async () => {
+    const host = makeHost('active-scene-123');
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+
+    await executor('transport_play', {});
+
+    expect(mockInvokeSas).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'transport_play',
+        params: {},
+      })
     );
-    const snapshot = await buildSceneContextSnapshot(host);
-    expect(typeof snapshot).toBe('string');
+  });
+
+  it('executor returns a structured failure for unknown tool names (does not throw)', async () => {
+    const host = makeHost();
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+
+    const result = await executor('not_a_real_tool', {});
+
+    expect(result.success).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("Unknown tool 'not_a_real_tool'");
+    expect(result.stderr).toContain('scene_get_tracks');
+    expect(mockInvokeSas).not.toHaveBeenCalled();
+  });
+
+  it('skips sceneId injection when no scene is active', async () => {
+    const host = makeHost(null);
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+
+    await executor('scene_get_tracks', {});
+
+    expect(mockInvokeSas).toHaveBeenCalledWith(
+      expect.objectContaining({
+        params: {}, // no sceneId injected
+      })
+    );
   });
 });

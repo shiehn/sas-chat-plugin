@@ -1,160 +1,127 @@
 /**
- * Panel tool surface — bridges the host's full app-tool registry into the
- * chat agent's `ChatAgentTool[]` interface.
+ * panel-tools — discover the host's scene-scoped tools and adapt them for
+ * the agent loop.
  *
- * Section 15 of ai-orchestration-design.md (updated): instead of hand-wiring
- * a narrow subset of host methods, the chat plugin asks the host for every
- * registered app tool scoped to `'scene'` and exposes them all to the LLM.
- * Future tools land in chat automatically. The host (`PluginHostImpl`)
- * handles scope filtering and active-scene auto-binding, so this module
- * stays dumb and generic.
+ * Two outputs:
+ *   - `tools`: the LLM-facing `LLMTool[]` (Gemini `functionDeclarations`
+ *     shape) handed to `host.generateWithLLMTools`.
+ *   - `executor`: a `ToolExecutor` that maps each function call to a
+ *     subprocess invocation of the `sas` CLI.
  *
- * Mutates flag: we conservatively treat every app tool as mutating so the
- * ChatAgent's loop refreshes scene context after each call (Section 23.7
- * reinforcement injection). The extra LLM input rebuild per tool is cheap;
- * correctness is paramount and per-tool tagging can come later.
+ * Tool discovery still goes through `host.listAppTools({ scope: 'scene' })`
+ * — that gives us the same authoritative list the CLI exposes. Execution
+ * goes through the CLI subprocess so the chat plugin gets the same agent-
+ * legibility surface (stderr remediation, prerequisite chains, exit codes)
+ * external agents like Claude Code see at the terminal.
  */
 
-import type { ChatAgentTool } from './chat-agent';
+import type {
+  PluginHost,
+  PluginAppTool,
+  LLMTool,
+  LLMFunctionDeclaration,
+} from '@signalsandsorcery/plugin-sdk';
+import { invokeSas } from './sas-tool-handler';
+import type { ToolExecutor } from './agent-loop';
+
+export interface PanelTools {
+  /** LLM-facing tool declarations (single `LLMTool` wrapping all functions). */
+  tools: LLMTool[];
+  /** Dispatches function calls to the `sas` CLI subprocess. */
+  executor: ToolExecutor;
+}
+
+export interface BuildPanelToolsOptions {
+  host: PluginHost;
+  /** Paths for spawning the `sas` CLI. From `host.getCliPaths()` typically. */
+  cliPaths: { appExe: string; cliEntry: string };
+}
 
 /**
- * Minimal surface the panel needs from the host.
+ * Build the tools surface for the chat plugin's agent loop.
  *
- * This is a structural subset of `PluginHost` from `@signalsandsorcery/plugin-sdk`
- * — kept narrow here so tests can mock with a tiny object and so this module
- * doesn't import the full SDK type surface.
+ * The active scene id is captured at build time and injected into every
+ * scene-scoped tool call whose schema declares a `sceneId` property. This
+ * mirrors `PluginHostImpl`'s `autoBindSceneId` behavior — without this,
+ * the CLI subprocess (which has no notion of "active scene") could target
+ * the wrong scene.
  */
-export interface PanelHost {
-  listAppTools(opts?: { scope?: 'scene' | 'project' }): Promise<PanelAppTool[]>;
-  executeAppTool(
-    name: string,
-    params: Record<string, unknown>
-  ): Promise<PanelAppToolResult>;
-}
-
-export interface PanelAppTool {
-  name: string;
-  description: string;
-  inputSchema: { type: 'object'; properties?: Record<string, unknown>; required?: string[] };
-  scope?: 'scene' | 'project';
-}
-
-export interface PanelAppToolResult {
-  success: boolean;
-  action: string;
-  message?: string;
-  error?: string;
-  data?: unknown;
-}
-
-// -----------------------------------------------------------------------------
-// Tool building
-// -----------------------------------------------------------------------------
-
-export async function buildPanelTools(host: PanelHost): Promise<ChatAgentTool[]> {
+export async function buildPanelTools(
+  options: BuildPanelToolsOptions
+): Promise<PanelTools> {
+  const { host, cliPaths } = options;
   const appTools = await host.listAppTools({ scope: 'scene' });
-  return appTools.map((t): ChatAgentTool => ({
-    name: t.name,
-    description: t.description,
+  const declarations = appTools.map(toFunctionDeclaration);
+  const tools: LLMTool[] =
+    declarations.length > 0 ? [{ functionDeclarations: declarations }] : [];
+
+  const toolByName = new Map<string, PluginAppTool>(
+    appTools.map((t) => [t.name, t])
+  );
+  const activeSceneId = host.getActiveSceneId();
+
+  const executor: ToolExecutor = async (name, args) => {
+    const def = toolByName.get(name);
+    if (!def) {
+      // Unknown tool — feed back a structured failure so the model can
+      // recover (e.g., re-pick from the actual list). Do not throw.
+      const known = appTools.map((t) => t.name).join(', ');
+      return {
+        success: false,
+        exitCode: 1,
+        stdout: '',
+        stderr: `Unknown tool '${name}'. Available scene-scoped tools: ${known}`,
+      };
+    }
+
+    const params = injectActiveSceneId(args, def, activeSceneId);
+    return invokeSas({
+      action: name,
+      params,
+      appExe: cliPaths.appExe,
+      cliEntry: cliPaths.cliEntry,
+    });
+  };
+
+  return { tools, executor };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function toFunctionDeclaration(tool: PluginAppTool): LLMFunctionDeclaration {
+  // The host emits JSON Schema in `inputSchema`. Gemini accepts a deliberate
+  // subset; the shape is compatible enough to pass through verbatim. If
+  // properties is undefined, surface an empty object so Gemini doesn't
+  // reject the declaration.
+  const properties = isRecord(tool.inputSchema.properties)
+    ? tool.inputSchema.properties
+    : {};
+  return {
+    name: tool.name,
+    description: tool.description,
     parameters: {
       type: 'object',
-      properties: t.inputSchema.properties,
+      properties,
+      required: tool.inputSchema.required,
     },
-    // Every app tool may mutate — refresh scene context after each call.
-    mutates: true,
-    handler: async (params) => {
-      const result = await host.executeAppTool(t.name, params);
-      if (!result.success) {
-        throw new Error(result.error ?? result.message ?? `${t.name} failed`);
-      }
-      // Return the tool's payload — handlers in the registry wrap their
-      // result in `data`. Falling back to a success marker keeps the LLM
-      // output readable for tools that don't return a body.
-      return result.data ?? { ok: true };
-    },
-  }));
+  };
 }
 
-// -----------------------------------------------------------------------------
-// Scene snapshot builder (Section 23.7 reinforcement)
-// -----------------------------------------------------------------------------
-
-/**
- * Short human-readable scene summary for system-prompt injection.
- * Uses the same app-tool bridge so it sees the full scene, not just
- * plugin-owned tracks. Called once at turn start and after every mutating
- * tool call.
- */
-export async function buildSceneContextSnapshot(host: PanelHost): Promise<string> {
-  try {
-    const [tracksResult, ctxResult] = await Promise.all([
-      host.executeAppTool('scene_get_tracks', {}),
-      host.executeAppTool('get_musical_context', {}),
-    ]);
-
-    const ctx = pickMusicalContext(ctxResult);
-    const tracks = pickTrackSummaries(tracksResult);
-
-    const keyBpm = `key=${ctx.key ?? 'unknown'}, bpm=${ctx.bpm ?? 'unknown'}`;
-    if (tracks.length === 0) {
-      return `Active scene is empty (no tracks). ${keyBpm}.`;
-    }
-    const trackLines = tracks
-      .map((t) => `  - ${t.name}${t.role ? ` (${t.role})` : ''} [id=${t.id}]`)
-      .join('\n');
-    return `Active scene: ${keyBpm}. Tracks:\n${trackLines}`;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return `Scene state unavailable: ${msg}`;
+function injectActiveSceneId(
+  args: Record<string, unknown>,
+  def: PluginAppTool,
+  activeSceneId: string | null
+): Record<string, unknown> {
+  if (!activeSceneId) return args;
+  const props = def.inputSchema.properties;
+  if (!isRecord(props)) return args;
+  if (!('sceneId' in props)) return args;
+  if ('sceneId' in args && args.sceneId !== undefined && args.sceneId !== '') {
+    return args;
   }
-}
-
-// -----------------------------------------------------------------------------
-// Result parsers — tool payloads are opaque so we defensively pluck fields.
-// -----------------------------------------------------------------------------
-
-function pickMusicalContext(
-  result: PanelAppToolResult
-): { key?: string; bpm?: number } {
-  if (!result.success) return {};
-  const data = unwrap(result.data);
-  if (!isRecord(data)) return {};
-  const key = typeof data.key === 'string' ? data.key : undefined;
-  const bpm = typeof data.bpm === 'number' ? data.bpm : undefined;
-  return { key, bpm };
-}
-
-function pickTrackSummaries(
-  result: PanelAppToolResult
-): Array<{ id: string; name: string; role?: string }> {
-  if (!result.success) return [];
-  const data = unwrap(result.data);
-  const rawList = isRecord(data) && Array.isArray(data.tracks) ? data.tracks : data;
-  if (!Array.isArray(rawList)) return [];
-  return rawList
-    .map((t): { id: string; name: string; role?: string } | null => {
-      if (!isRecord(t)) return null;
-      const id = typeof t.id === 'string' ? t.id : typeof t.trackId === 'string' ? t.trackId : null;
-      if (!id) return null;
-      const name =
-        typeof t.displayName === 'string'
-          ? t.displayName
-          : typeof t.name === 'string'
-          ? t.name
-          : id;
-      const role = typeof t.role === 'string' ? t.role : undefined;
-      return { id, name, role };
-    })
-    .filter((t): t is { id: string; name: string; role?: string } => t !== null);
-}
-
-function unwrap(data: unknown): unknown {
-  // ToolRegistry results are stuffed into `data` as the full OperationResult.
-  // Peek one level deeper if we see the wrapper shape.
-  if (isRecord(data) && 'data' in data && !('tracks' in data) && !('key' in data)) {
-    return data.data;
-  }
-  return data;
+  return { ...args, sceneId: activeSceneId };
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
