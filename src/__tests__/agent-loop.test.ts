@@ -393,6 +393,107 @@ describe('AgentLoop', () => {
     expect(secondCall.contents[2].role).toBe('user');
   });
 
+  it('recovers from a Gemini 400 "function response turn" error by resetting history and retrying once', async () => {
+    // Long history accumulated from prior failed turns:
+    // user → model(text) → user → model(fc) → user(fr) → model(text)
+    // Then we kick off a fresh user turn ("create a beat...") and the
+    // first request 400s. The loop should drop everything except the
+    // most-recent user message and retry — and the retry succeeds.
+    const shapeError = new Error(
+      'LLM tool-use generation failed: Request failed: 400 - ' +
+        '{"error":{"code":400,"message":"Please ensure that function ' +
+        'response turn comes immediately after a function call turn."}}'
+    );
+
+    const host = {
+      generateWithLLMTools: jest.fn() as jest.Mock,
+    };
+    host.generateWithLLMTools
+      .mockRejectedValueOnce(shapeError)
+      .mockResolvedValueOnce({
+        candidates: [{ content: { role: 'model', parts: [{ text: 'fresh start' }] } }],
+      });
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: jest.fn(),
+      systemPrompt: SYSTEM_PROMPT,
+    });
+
+    // Seed the loop with a long, possibly-malformed history.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (loop as any).contents = [
+      { role: 'user', parts: [{ text: 'old: make a beat' }] },
+      { role: 'model', parts: [{ text: 'What scene name?' }] },
+      { role: 'user', parts: [{ text: 'old: funky break' }] },
+      { role: 'model', parts: [{ functionCall: { name: 'compose_scene', args: {} } }] },
+      {
+        role: 'user',
+        parts: [{ functionResponse: { name: 'compose_scene', response: { success: false } } }],
+      },
+      { role: 'model', parts: [{ text: "I'm sorry, I'm encountering..." }] },
+    ];
+
+    const result = await loop.run('create a beat with kick, snare, hat');
+
+    expect(result.text).toBe('fresh start');
+    // After retry: contents = [user('create a beat...'), model('fresh start')]
+    // (the 6 stale turns were dropped on retry).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((loop as any).contents).toHaveLength(2);
+    expect(host.generateWithLLMTools).toHaveBeenCalledTimes(2);
+
+    // First request: full polluted history + new user msg = 7 entries.
+    const firstCall = host.generateWithLLMTools.mock.calls[0][0] as {
+      contents: unknown[];
+    };
+    expect(firstCall.contents).toHaveLength(7);
+    // Second (retry) request: just the new user msg.
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: { role: string; parts: { text?: string }[] }[];
+    };
+    expect(secondCall.contents).toHaveLength(1);
+    expect(secondCall.contents[0].parts[0].text).toBe('create a beat with kick, snare, hat');
+  });
+
+  it('does not auto-retry shape errors past iteration 1 (avoids retry loops)', async () => {
+    const shapeError = new Error(
+      '400 - "function response turn comes immediately after function call turn"'
+    );
+
+    const host = {
+      generateWithLLMTools: jest.fn() as jest.Mock,
+    };
+    // First send returns a tool call. After the tool runs, the second
+    // send hits the shape error — at iteration 2, no retry. The error
+    // should propagate to the caller.
+    host.generateWithLLMTools
+      .mockResolvedValueOnce({
+        candidates: [
+          { content: { role: 'model', parts: [{ functionCall: { name: 'set_volume', args: {} } }] } },
+        ],
+      })
+      .mockRejectedValueOnce(shapeError);
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: jest.fn().mockResolvedValue({
+        success: true,
+        exitCode: 0,
+        stdout: '{}',
+        stderr: '',
+      }) as ToolExecutor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+
+    await expect(loop.run('do it')).rejects.toThrow(/function response/);
+    expect(host.generateWithLLMTools).toHaveBeenCalledTimes(2);
+  });
+
   it('truncates large stdout/stderr in functionResponse to keep context bounded', async () => {
     // 8 KB stdout — twice the 4_000-char cap.
     const bigStdout = 'A'.repeat(8_000);

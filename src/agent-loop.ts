@@ -170,7 +170,31 @@ export class AgentLoop {
         tools: this.tools.length > 0 ? this.tools : undefined,
       };
 
-      const response = await this.host.generateWithLLMTools(request);
+      let response;
+      try {
+        response = await this.host.generateWithLLMTools(request);
+      } catch (err) {
+        // Gemini sometimes rejects an otherwise-valid conversation with the
+        // 400 "function response turn comes immediately after a function
+        // call turn" error after a long sequence of failed tool calls.
+        // Best-effort recovery: drop everything except the most recent
+        // user message and retry once. If the retry also fails, surface
+        // the error to the user.
+        const message = err instanceof Error ? err.message : String(err);
+        const isShapeError =
+          message.includes('400') &&
+          message.toLowerCase().includes('function response');
+        if (isShapeError && iteration === 1 && this.contents.length > 1) {
+          const lastUser = this.contents[this.contents.length - 1];
+          this.contents = lastUser ? [lastUser] : [];
+          response = await this.host.generateWithLLMTools({
+            ...request,
+            contents: [...this.contents],
+          });
+        } else {
+          throw err;
+        }
+      }
       const candidate = response.candidates[0];
       if (!candidate) {
         // Empty candidate list shouldn't happen in normal flow; surface a

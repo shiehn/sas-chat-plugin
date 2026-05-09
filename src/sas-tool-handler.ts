@@ -47,7 +47,15 @@ export interface SasToolResult {
   parsedStdout?: unknown;
 }
 
-const DEFAULT_TIMEOUT_MS = 60_000;
+/**
+ * Default per-call timeout. Composite workflows (`compose_scene`,
+ * `make_beat`, `revise_track`) load synth plugins and run per-track LLM
+ * MIDI generation in series — three-track scenes routinely take 90 s+.
+ * 60 s was killing them mid-stride; 300 s aligns with the upstream LLM
+ * call's own timeout and keeps interactive failures fast for shorter
+ * tools (a stuck 30-second tool still surfaces in well under the cap).
+ */
+const DEFAULT_TIMEOUT_MS = 300_000;
 
 /**
  * Convert a parameters object to CLI args using the `--json '{...}'`
