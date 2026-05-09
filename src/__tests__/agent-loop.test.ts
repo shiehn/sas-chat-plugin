@@ -11,7 +11,7 @@
  *   - events emitted in order
  */
 
-import { AgentLoop, type AgentLoopEvent, type ToolExecutor } from '../agent-loop';
+import { AgentLoop, truncateForLLM, type AgentLoopEvent, type ToolExecutor } from '../agent-loop';
 import type { LLMTool, LLMToolUseResponse } from '@signalsandsorcery/plugin-sdk';
 
 // ---------------------------------------------------------------------------
@@ -347,5 +347,105 @@ describe('AgentLoop', () => {
     expect(secondCall.contents).toHaveLength(3);
     expect(secondCall.contents[0].parts[0].text).toBe('one');
     expect(secondCall.contents[2].parts[0].text).toBe('two');
+  });
+
+  it('forces role: model on assistant turns even when upstream omits it', async () => {
+    // Simulate a malformed upstream response missing the role field. The
+    // loop must default to 'model' so the next request still passes
+    // Gemini's strict alternation check.
+    const host = {
+      generateWithLLMTools: jest.fn() as jest.Mock,
+    };
+    host.generateWithLLMTools
+      .mockResolvedValueOnce({
+        candidates: [
+          {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            content: { parts: [{ functionCall: { name: 'set_volume', args: {} } }] } as any,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        candidates: [{ content: { role: 'model', parts: [{ text: 'done' }] } }],
+      });
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: jest.fn().mockResolvedValue({
+        success: true,
+        exitCode: 0,
+        stdout: '{}',
+        stderr: '',
+      }) as ToolExecutor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+
+    await loop.run('do it');
+
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: { role: string }[];
+    };
+    // user('do it') → model(functionCall) → user(functionResponse)
+    expect(secondCall.contents).toHaveLength(3);
+    expect(secondCall.contents[1].role).toBe('model'); // <- normalized
+    expect(secondCall.contents[2].role).toBe('user');
+  });
+
+  it('truncates large stdout/stderr in functionResponse to keep context bounded', async () => {
+    // 8 KB stdout — twice the 4_000-char cap.
+    const bigStdout = 'A'.repeat(8_000);
+    const host = makeScriptedHost([
+      toolCallResponse('compose_scene', {}),
+      textResponse('done'),
+    ]);
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: jest.fn().mockResolvedValue({
+        success: true,
+        exitCode: 0,
+        stdout: bigStdout,
+        stderr: '',
+      }) as ToolExecutor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+
+    await loop.run('compose');
+
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: Array<{
+        parts: Array<{ functionResponse?: { response: { stdout: string } } }>;
+      }>;
+    };
+    const fr = secondCall.contents[secondCall.contents.length - 1].parts[0].functionResponse;
+    expect(fr).toBeDefined();
+    const stdout = fr!.response.stdout;
+    expect(stdout.length).toBeLessThan(bigStdout.length);
+    expect(stdout).toMatch(/truncated/);
+    // Head and tail should both be present (structure-preserving truncation).
+    expect(stdout.startsWith('A')).toBe(true);
+    expect(stdout.endsWith('A')).toBe(true);
+  });
+});
+
+describe('truncateForLLM', () => {
+  it('passes through strings under the cap unchanged', () => {
+    const small = 'x'.repeat(1000);
+    expect(truncateForLLM(small)).toBe(small);
+  });
+
+  it('keeps both head and tail with a marker in between for oversized strings', () => {
+    const big = 'a'.repeat(2_400) + 'MIDDLE_MARKER'.repeat(200) + 'z'.repeat(1_200);
+    const result = truncateForLLM(big);
+    expect(result.length).toBeLessThan(big.length);
+    expect(result).toMatch(/truncated/);
+    expect(result.startsWith('a')).toBe(true);
+    expect(result.endsWith('z')).toBe(true);
+    // The middle marker should be gone (it's in the truncated region).
+    expect(result.includes('MIDDLE_MARKER')).toBe(false);
   });
 });

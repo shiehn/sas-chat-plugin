@@ -183,7 +183,18 @@ export class AgentLoop {
       // Record the model's response in conversation history. Important: this
       // includes `functionCall` parts, which Gemini requires to be present
       // when the next turn carries `functionResponse` parts.
-      this.contents.push(candidate.content);
+      //
+      // Defensive normalization: some upstream paths (proxy quirks, edge
+      // cases) return content without an explicit role. Gemini's strict
+      // alternation check rejects role-less turns with the misleading
+      // "function response turn comes immediately after a function call
+      // turn" error — force `role: 'model'` here so we always send a
+      // well-formed turn.
+      const modelContent: LLMContent = {
+        role: candidate.content.role ?? 'model',
+        parts: candidate.content.parts ?? [],
+      };
+      this.contents.push(modelContent);
 
       const parts = candidate.content.parts;
       const toolCallParts = parts.filter(hasFunctionCall);
@@ -238,11 +249,18 @@ export class AgentLoop {
             // Gemini accepts arbitrary JSON in the response. Mirror what the
             // CLI emits so the model sees the same fields a shell agent
             // would: success/exitCode/stdout/stderr.
+            //
+            // Truncate large outputs to keep the conversation context
+            // bounded. compose_scene-class workflows return ~5kb operation
+            // result JSON per call; over a few turns this saturates the
+            // context window and Gemini starts rejecting requests with
+            // misleading shape errors. The model only needs the head/tail
+            // to recover; we keep both.
             response: {
               success: result.success,
               exitCode: result.exitCode,
-              stdout: result.stdout,
-              stderr: result.stderr,
+              stdout: truncateForLLM(result.stdout),
+              stderr: truncateForLLM(result.stderr),
             },
           },
         });
@@ -277,4 +295,21 @@ function hasFunctionCall(
 
 function hasText(part: LLMPart): part is LLMPart & { text: string } {
   return typeof part.text === 'string' && part.text.length > 0;
+}
+
+/** Cap CLI output fed back to the LLM. Big enough for any reasonable
+ *  remediation envelope; small enough that a few turns don't blow the
+ *  context budget. Keeps the head + tail so structure (e.g. JSON braces)
+ *  remains parseable.
+ */
+const LLM_OUTPUT_CAP = 4_000;
+const LLM_OUTPUT_HEAD = 2_400;
+const LLM_OUTPUT_TAIL = 1_200;
+
+export function truncateForLLM(s: string): string {
+  if (s.length <= LLM_OUTPUT_CAP) return s;
+  const head = s.slice(0, LLM_OUTPUT_HEAD);
+  const tail = s.slice(-LLM_OUTPUT_TAIL);
+  const omitted = s.length - head.length - tail.length;
+  return `${head}\n\n[... ${omitted} chars truncated ...]\n\n${tail}`;
 }
