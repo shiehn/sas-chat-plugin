@@ -24,8 +24,12 @@ export type {
   ToolExecutionResult,
 } from './agent-loop';
 
-export { invokeSas } from './sas-tool-handler';
-export type { SasToolInvocation, SasToolResult } from './sas-tool-handler';
+export { invokeSas, spawnSasArgs } from './sas-tool-handler';
+export type {
+  SasToolInvocation,
+  SasArgsInvocation,
+  SasToolResult,
+} from './sas-tool-handler';
 
 export { buildPanelTools } from './panel-tools';
 export type { PanelTools } from './panel-tools';

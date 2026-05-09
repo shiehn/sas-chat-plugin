@@ -11,7 +11,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
 
-import { invokeSas, paramsToCliArgs } from '../sas-tool-handler';
+import { invokeSas, paramsToCliArgs, spawnSasArgs } from '../sas-tool-handler';
 
 // ---------------------------------------------------------------------------
 // paramsToCliArgs unit coverage
@@ -166,5 +166,144 @@ describe('invokeSas — subprocess behavior', () => {
       cliEntry: stubPath,
     });
     expect(result.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// spawnSasArgs — verbatim-args primitive used by the PI-agent migration.
+// Reuses the same stub CLI; difference is the caller hands over raw argv.
+// ---------------------------------------------------------------------------
+
+describe('spawnSasArgs — verbatim args', () => {
+  let stubPath: string;
+
+  beforeAll(() => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sas-spawn-args-'));
+    stubPath = path.join(tmpDir, 'stub-cli.js');
+    fs.writeFileSync(
+      stubPath,
+      `
+      // Echo argv back as JSON so tests can assert what we passed verbatim.
+      const args = process.argv.slice(2);
+      let exitCode = 0;
+      let stderr = '';
+      let sleepMs = 0;
+      // Test sentinels — same shape as the invokeSas stub but read off argv
+      // so callers can mix them in anywhere.
+      for (const a of args) {
+        if (a.startsWith('--__exit=')) exitCode = Number(a.slice('--__exit='.length));
+        if (a.startsWith('--__stderr=')) stderr = a.slice('--__stderr='.length);
+        if (a.startsWith('--__sleep=')) sleepMs = Number(a.slice('--__sleep='.length));
+      }
+      const finish = () => {
+        if (stderr.length > 0) process.stderr.write(stderr);
+        process.stdout.write(JSON.stringify({ args }));
+        process.exit(exitCode);
+      };
+      if (sleepMs > 0) setTimeout(finish, sleepMs);
+      else finish();
+      `,
+      'utf8'
+    );
+  });
+
+  it('passes args verbatim to the child process', async () => {
+    const result = await spawnSasArgs({
+      args: ['help', 'scene_create'],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.parsedStdout).toEqual({ args: ['help', 'scene_create'] });
+  });
+
+  it('preserves --json blobs the caller already constructed', async () => {
+    // The whole point of verbatim args: the caller (the LLM) decides
+    // serialisation. We pass through whatever they hand us.
+    const jsonBody = JSON.stringify({ name: 'Bass', volume: 0.8 });
+    const result = await spawnSasArgs({
+      args: ['compose_scene', '--json', jsonBody],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.parsedStdout).toEqual({
+      args: ['compose_scene', '--json', jsonBody],
+    });
+  });
+
+  it('returns success=false on non-zero exit and captures stderr', async () => {
+    const result = await spawnSasArgs({
+      args: ['broken_tool', '--__exit=1', '--__stderr=missing prerequisites\n'],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toBe('missing prerequisites');
+  });
+
+  it('rejects on timeout', async () => {
+    await expect(
+      spawnSasArgs({
+        args: ['slow_tool', '--__sleep=5000'],
+        appExe: process.execPath,
+        cliEntry: stubPath,
+        timeoutMs: 100,
+      })
+    ).rejects.toThrow(/timed out/);
+  });
+
+  it('rejects when the binary cannot be spawned', async () => {
+    await expect(
+      spawnSasArgs({
+        args: ['whatever'],
+        appExe: '/path/that/does/not/exist',
+        cliEntry: stubPath,
+      })
+    ).rejects.toThrow(/Failed to spawn/);
+  });
+
+  it('rejects mid-flight when the supplied AbortSignal fires', async () => {
+    const controller = new AbortController();
+    const promise = spawnSasArgs({
+      args: ['slow_tool', '--__sleep=5000'],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+      signal: controller.signal,
+      timeoutMs: 10_000,
+    });
+    // Give the child a beat to actually start, then abort.
+    setTimeout(() => controller.abort(), 30);
+    await expect(promise).rejects.toThrow(/aborted/);
+  });
+
+  it('rejects synchronously when given an already-aborted signal', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      spawnSasArgs({
+        args: ['noop'],
+        appExe: process.execPath,
+        cliEntry: stubPath,
+        signal: controller.signal,
+      })
+    ).rejects.toThrow(/aborted/);
+  });
+
+  it('handles empty args without indexing past argv', async () => {
+    // Edge case: an LLM that just runs `sas` (no subcommand) should still
+    // get a clean error path rather than blowing up the stub. The stub
+    // exits 0 with `args: []`; the timeout-cmd label uses '<no-args>'.
+    const result = await spawnSasArgs({
+      args: [],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+    });
+    expect(result.success).toBe(true);
+    expect(result.parsedStdout).toEqual({ args: [] });
   });
 });

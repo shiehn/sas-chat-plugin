@@ -31,6 +31,29 @@ export interface SasToolInvocation {
   timeoutMs?: number;
 }
 
+/**
+ * Verbatim-args spawn invocation. Use this when the caller (e.g. an LLM
+ * agent driving the CLI like a shell) supplies a full argv array rather
+ * than an action+params split.
+ *
+ * The PI-Agent migration uses this surface so the model decides argument
+ * formatting itself: `["help"]`, `["help", "scene_create"]`,
+ * `["compose_scene", "--json", "{...}"]`. No per-arg coercion happens
+ * here — that's the caller's responsibility.
+ */
+export interface SasArgsInvocation {
+  /** CLI argv to pass verbatim, e.g. ['list-actions'] or ['help', 'scene_create']. */
+  args: string[];
+  /** Absolute path to the Electron binary (host supplies via `app.getPath('exe')`). */
+  appExe: string;
+  /** Absolute path to the CLI's compiled JS entry (`dist/cli/sas.js`). */
+  cliEntry: string;
+  /** Per-call timeout. Default matches `invokeSas`. */
+  timeoutMs?: number;
+  /** Optional abort signal — kills the child with SIGTERM when triggered. */
+  signal?: AbortSignal;
+}
+
 export interface SasToolResult {
   /** True when the CLI exited with code 0. */
   success: boolean;
@@ -80,19 +103,26 @@ export function paramsToCliArgs(params: Record<string, unknown>): string[] {
 }
 
 /**
- * Spawn `sas <action> <kvargs...>` and capture its result.
+ * Spawn `<appExe> <cliEntry> <args...>` (with `ELECTRON_RUN_AS_NODE=1`) and
+ * capture its result.
+ *
+ * This is the lowest-level primitive — `args` is passed verbatim to the
+ * child process. Use this when the caller drives the CLI like an external
+ * shell agent (PI-Agent migration target). Use `invokeSas` for the legacy
+ * action+params shape.
  *
  * Resolves with a `SasToolResult` even on non-zero exit — the agent loop
  * decides what to do with stderr (typically: feed it back as a tool response
  * and let the model recover). Rejects only on spawn failure (binary missing)
- * or timeout, which the loop translates into a synthetic failure response.
+ * or timeout, which the caller translates into a synthetic failure response.
  */
-export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolResult> {
+export async function spawnSasArgs(invocation: SasArgsInvocation): Promise<SasToolResult> {
   const timeoutMs = invocation.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const args = [invocation.cliEntry, invocation.action, ...paramsToCliArgs(invocation.params)];
+  // The CLI entry is always argv[0]; the rest is what the caller supplied.
+  const childArgs = [invocation.cliEntry, ...invocation.args];
 
   return new Promise<SasToolResult>((resolve, reject) => {
-    const child = spawn(invocation.appExe, args, {
+    const child = spawn(invocation.appExe, childArgs, {
       env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -100,6 +130,7 @@ export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolR
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let aborted = false;
     let settled = false;
 
     const timer = setTimeout(() => {
@@ -110,6 +141,22 @@ export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolR
         // already exited
       }
     }, timeoutMs);
+
+    const onAbort = (): void => {
+      aborted = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // already exited
+      }
+    };
+    if (invocation.signal) {
+      if (invocation.signal.aborted) {
+        onAbort();
+      } else {
+        invocation.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }
 
     child.stdout?.on('data', (chunk: Buffer) => {
       stdout += chunk.toString();
@@ -122,6 +169,7 @@ export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolR
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      invocation.signal?.removeEventListener('abort', onAbort);
       reject(
         new Error(
           `Failed to spawn sas CLI (${invocation.appExe} ${invocation.cliEntry}): ${err.message}`
@@ -133,13 +181,17 @@ export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolR
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      invocation.signal?.removeEventListener('abort', onAbort);
 
       if (timedOut) {
-        reject(
-          new Error(
-            `sas CLI '${invocation.action}' timed out after ${timeoutMs}ms`
-          )
-        );
+        const cmd = invocation.args[0] ?? '<no-args>';
+        reject(new Error(`sas CLI '${cmd}' timed out after ${timeoutMs}ms`));
+        return;
+      }
+
+      if (aborted) {
+        const cmd = invocation.args[0] ?? '<no-args>';
+        reject(new Error(`sas CLI '${cmd}' aborted`));
         return;
       }
 
@@ -161,5 +213,21 @@ export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolR
         parsedStdout,
       });
     });
+  });
+}
+
+/**
+ * Spawn `sas <action> --json '<params>'` and capture its result.
+ *
+ * Legacy wrapper around `spawnSasArgs` for the action+params shape used by
+ * the current Gemini-function-calling loop (`panel-tools.ts`). New callers
+ * should prefer `spawnSasArgs` directly.
+ */
+export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolResult> {
+  return spawnSasArgs({
+    args: [invocation.action, ...paramsToCliArgs(invocation.params)],
+    appExe: invocation.appExe,
+    cliEntry: invocation.cliEntry,
+    timeoutMs: invocation.timeoutMs,
   });
 }
