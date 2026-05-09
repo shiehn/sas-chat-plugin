@@ -11,6 +11,11 @@
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     },
+    "./host": {
+      "types": "./dist/host.d.ts",
+      "import": "./dist/host.mjs",
+      "require": "./dist/host.js"
+    },
     "./plugin.json": "./src/plugin.json"
   },
   "files": [

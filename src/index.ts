@@ -17,7 +17,9 @@
 export { ChatPanelPlugin, CHAT_PANEL_PLUGIN_ID } from './plugin';
 export type { ChatInvocation, ChatResponse } from './plugin';
 
-export { AgentLoop } from './agent-loop';
+// Type-only re-exports — renderer-safe (TypeScript erases at build time).
+// The runtime values live at '@signalsandsorcery/chat-plugin/host' so they
+// don't pull `node:child_process` into the renderer's module graph.
 export type {
   AgentLoopOptions,
   AgentLoopResult,
@@ -26,11 +28,7 @@ export type {
   ToolExecutor,
   ToolExecutionResult,
 } from './agent-loop';
-
-export { invokeSas } from './sas-tool-handler';
 export type { SasToolInvocation, SasToolResult } from './sas-tool-handler';
-
-export { buildPanelTools } from './panel-tools';
 export type { PanelTools } from './panel-tools';
 
 export { default } from './plugin';

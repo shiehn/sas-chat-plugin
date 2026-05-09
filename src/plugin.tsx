@@ -28,13 +28,31 @@ import type {
   PluginSkill,
   PluginUIProps,
 } from '@signalsandsorcery/plugin-sdk';
-import {
+import type {
   AgentLoop,
-  type AgentLoopEvent,
-  type AgentLoopResult,
+  AgentLoopEvent,
+  AgentLoopResult,
 } from './agent-loop';
-import { buildPanelTools, type PanelTools } from './panel-tools';
+import type { PanelTools } from './panel-tools';
 import { ChatPanel } from './ui/ChatPanel';
+
+// Lazy-load the host-only deps. These pull in node:child_process via
+// sas-tool-handler, so importing them at module top would crash the renderer
+// (Vite generates a failing shim for child_process in browser context).
+// Dynamic imports become separate chunks that only load when activate() /
+// ensureAgent() / onSceneChanged() actually run — which only happens in the
+// main process. In the renderer, this Promise is never awaited, so the chunk
+// is never fetched.
+async function loadHostDeps(): Promise<{
+  AgentLoop: typeof import('./agent-loop').AgentLoop;
+  buildPanelTools: typeof import('./panel-tools').buildPanelTools;
+}> {
+  const [{ AgentLoop }, { buildPanelTools }] = await Promise.all([
+    import('./agent-loop'),
+    import('./panel-tools'),
+  ]);
+  return { AgentLoop, buildPanelTools };
+}
 
 export const CHAT_PANEL_PLUGIN_ID = '@signalsandsorcery/chat-panel';
 
@@ -169,6 +187,7 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     // (e.g., test env, or app not fully booted), defer until first chat().
     const cliPaths = host.getCliPaths();
     if (cliPaths) {
+      const { AgentLoop, buildPanelTools } = await loadHostDeps();
       this.panelTools = await buildPanelTools({ host, cliPaths });
       this.agent = new AgentLoop({
         host,
@@ -198,6 +217,7 @@ export class ChatPanelPlugin implements GeneratorPlugin {
           'Make sure the plugin runs in the main process and `npm run build:cli` has produced dist/cli/sas.js.'
       );
     }
+    const { AgentLoop, buildPanelTools } = await loadHostDeps();
     this.panelTools = await buildPanelTools({ host: this.host, cliPaths });
     this.agent = new AgentLoop({
       host: this.host,
@@ -245,6 +265,7 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     if (this.host) {
       const cliPaths = this.host.getCliPaths();
       if (!cliPaths) return;
+      const { AgentLoop, buildPanelTools } = await loadHostDeps();
       this.panelTools = await buildPanelTools({ host: this.host, cliPaths });
       if (this.agent) {
         // Construct a fresh loop with the new tools/executor; previous loop
