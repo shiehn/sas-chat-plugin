@@ -33,18 +33,39 @@ export interface ToolExecutionResult {
   stderr: string;
 }
 
+/** One newline-delimited chunk of subprocess output, surfaced live by the executor. */
+export interface ToolProgressChunk {
+  stream: 'stdout' | 'stderr';
+  line: string;
+}
+
 /**
  * Executes a tool call. Returning a result (success or failure) lets the
  * model recover from errors; throwing should be reserved for truly
  * exceptional cases (spawn failure, timeout) and is wrapped into a
  * synthetic failure response so the loop continues.
+ *
+ * `onProgress` is optional — when provided, the executor SHOULD forward
+ * each newline-delimited stdout/stderr line as it arrives so the UI can
+ * surface "what the long-running tool is doing right now" instead of
+ * sitting silent until close. Best-effort: dropping the callback or
+ * never invoking it must not affect correctness.
  */
 export type ToolExecutor = (
   name: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  onProgress?: (chunk: ToolProgressChunk) => void
 ) => Promise<ToolExecutionResult>;
 
 export type AgentLoopEvent =
+  | {
+      type: 'llm_call_start';
+      iteration: number;
+    }
+  | {
+      type: 'llm_call_end';
+      iteration: number;
+    }
   | {
       type: 'tool_call_start';
       iteration: number;
@@ -52,6 +73,13 @@ export type AgentLoopEvent =
       callId: string;
       toolName: string;
       toolArgs: Record<string, unknown>;
+    }
+  | {
+      type: 'tool_progress';
+      iteration: number;
+      callId: string;
+      stream: 'stdout' | 'stderr';
+      line: string;
     }
   | {
       type: 'tool_call_done';
@@ -213,29 +241,36 @@ export class AgentLoop {
       };
 
       let response;
+      emit({ type: 'llm_call_start', iteration });
       try {
-        response = await this.host.generateWithLLMTools(request);
-      } catch (err) {
-        // Gemini sometimes rejects an otherwise-valid conversation with the
-        // 400 "function response turn comes immediately after a function
-        // call turn" error after a long sequence of failed tool calls.
-        // Best-effort recovery: drop everything except the most recent
-        // user message and retry once. If the retry also fails, surface
-        // the error to the user.
-        const message = err instanceof Error ? err.message : String(err);
-        const isShapeError =
-          message.includes('400') &&
-          message.toLowerCase().includes('function response');
-        if (isShapeError && iteration === 1 && this.contents.length > 1) {
-          const lastUser = this.contents[this.contents.length - 1];
-          this.contents = lastUser ? [lastUser] : [];
-          response = await this.host.generateWithLLMTools({
-            ...request,
-            contents: [...this.contents],
-          });
-        } else {
-          throw err;
+        try {
+          response = await this.host.generateWithLLMTools(request);
+        } catch (err) {
+          // Gemini sometimes rejects an otherwise-valid conversation with the
+          // 400 "function response turn comes immediately after a function
+          // call turn" error after a long sequence of failed tool calls.
+          // Best-effort recovery: drop everything except the most recent
+          // user message and retry once. If the retry also fails, surface
+          // the error to the user.
+          const message = err instanceof Error ? err.message : String(err);
+          const isShapeError =
+            message.includes('400') &&
+            message.toLowerCase().includes('function response');
+          if (isShapeError && iteration === 1 && this.contents.length > 1) {
+            const lastUser = this.contents[this.contents.length - 1];
+            this.contents = lastUser ? [lastUser] : [];
+            response = await this.host.generateWithLLMTools({
+              ...request,
+              contents: [...this.contents],
+            });
+          } else {
+            throw err;
+          }
         }
+      } finally {
+        // Always pair llm_call_end with llm_call_start so the UI can clear
+        // its "thinking" indicator even when generateWithLLMTools throws.
+        emit({ type: 'llm_call_end', iteration });
       }
       const candidate = response.candidates[0];
       if (!candidate) {
@@ -293,8 +328,17 @@ export class AgentLoop {
         });
 
         let result: ToolExecutionResult;
+        const onProgress = (chunk: ToolProgressChunk): void => {
+          emit({
+            type: 'tool_progress',
+            iteration,
+            callId,
+            stream: chunk.stream,
+            line: chunk.line,
+          });
+        };
         try {
-          result = await this.toolExecutor(name, args);
+          result = await this.toolExecutor(name, args, onProgress);
         } catch (err) {
           const stderr = err instanceof Error ? err.message : String(err);
           result = { success: false, exitCode: -1, stdout: '', stderr };

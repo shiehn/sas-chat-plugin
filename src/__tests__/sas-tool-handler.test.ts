@@ -307,3 +307,180 @@ describe('spawnSasArgs — verbatim args', () => {
     expect(result.parsedStdout).toEqual({ args: [] });
   });
 });
+
+// ---------------------------------------------------------------------------
+// spawnSasArgs — onProgress line-buffering correctness.
+// Uses a dedicated stub that lets each test drive the chunk boundaries so we
+// can prove partial lines hold across writes and the trailing partial flushes
+// on close.
+// ---------------------------------------------------------------------------
+
+describe('spawnSasArgs — onProgress line buffering', () => {
+  let stubPath: string;
+
+  beforeAll(() => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sas-progress-'));
+    stubPath = path.join(tmpDir, 'progress-stub.js');
+    fs.writeFileSync(
+      stubPath,
+      `
+      // Replays a scripted sequence of writes so tests can assert that
+      // newline-buffering reassembles lines correctly across chunk boundaries.
+      // Script comes in as JSON via --json: { writes: [{ stream, text, delayMs }] }.
+      const args = process.argv.slice(2);
+      let script = { writes: [] };
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--json' && i + 1 < args.length) {
+          try { script = JSON.parse(args[i + 1]); } catch {}
+          i++;
+        }
+      }
+      let i = 0;
+      const next = () => {
+        if (i >= script.writes.length) {
+          process.exit(0);
+          return;
+        }
+        const w = script.writes[i++];
+        const stream = w.stream === 'stderr' ? process.stderr : process.stdout;
+        stream.write(w.text);
+        if (w.delayMs > 0) setTimeout(next, w.delayMs);
+        else setImmediate(next);
+      };
+      next();
+      `,
+      'utf8'
+    );
+  });
+
+  it('splits a multi-line chunk into one onProgress call per line', async () => {
+    const lines: Array<{ stream: string; line: string }> = [];
+    const result = await spawnSasArgs({
+      args: ['--json', JSON.stringify({ writes: [{ stream: 'stdout', text: 'a\nb\nc\n', delayMs: 0 }] })],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+      onProgress: (chunk) => lines.push(chunk),
+    });
+    expect(result.success).toBe(true);
+    // Three complete lines, each surfaced once. Trailing newline does not
+    // produce a fourth empty line.
+    expect(lines).toEqual([
+      { stream: 'stdout', line: 'a' },
+      { stream: 'stdout', line: 'b' },
+      { stream: 'stdout', line: 'c' },
+    ]);
+  });
+
+  it('holds a partial line across a chunk boundary until the next chunk', async () => {
+    // First chunk leaves "abc" with no newline; second chunk starts with
+    // "def\n". The buffer should emit ONE line ("abcdef"), not two halves.
+    const lines: Array<{ stream: string; line: string }> = [];
+    const result = await spawnSasArgs({
+      args: [
+        '--json',
+        JSON.stringify({
+          writes: [
+            { stream: 'stdout', text: 'abc', delayMs: 30 },
+            { stream: 'stdout', text: 'def\n', delayMs: 0 },
+          ],
+        }),
+      ],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+      onProgress: (chunk) => lines.push(chunk),
+    });
+    expect(result.success).toBe(true);
+    expect(lines).toEqual([{ stream: 'stdout', line: 'abcdef' }]);
+  });
+
+  it('does NOT flush a trailing un-terminated partial at close', async () => {
+    // Tools must terminate progress messages with `\n`. Anything left
+    // un-terminated at close is the tool's final result blob (caller
+    // gets it via the resolved promise / tool_call_done). Re-surfacing
+    // it as a progress line would duplicate the `↳ result` row visible
+    // in the chat panel — the exact bug this guards against.
+    const lines: Array<{ stream: string; line: string }> = [];
+    const result = await spawnSasArgs({
+      args: [
+        '--json',
+        JSON.stringify({
+          writes: [{ stream: 'stdout', text: 'trailing', delayMs: 0 }],
+        }),
+      ],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+      onProgress: (chunk) => lines.push(chunk),
+    });
+    expect(lines).toEqual([]);
+    // The accumulated stdout still contains the un-terminated content,
+    // so the caller (tool_call_done) gets it.
+    expect(result.stdout).toBe('trailing');
+  });
+
+  it('keeps stdout and stderr streams independent', async () => {
+    const lines: Array<{ stream: string; line: string }> = [];
+    await spawnSasArgs({
+      args: [
+        '--json',
+        JSON.stringify({
+          writes: [
+            { stream: 'stdout', text: 'one\n', delayMs: 10 },
+            { stream: 'stderr', text: 'warn\n', delayMs: 10 },
+            { stream: 'stdout', text: 'two\n', delayMs: 0 },
+          ],
+        }),
+      ],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+      onProgress: (chunk) => lines.push(chunk),
+    });
+    // Order is event-loop dependent across streams, so just assert the
+    // multiset.
+    expect(lines).toEqual(
+      expect.arrayContaining([
+        { stream: 'stdout', line: 'one' },
+        { stream: 'stderr', line: 'warn' },
+        { stream: 'stdout', line: 'two' },
+      ])
+    );
+    expect(lines).toHaveLength(3);
+  });
+
+  it('keeps the accumulated stdout/stderr unchanged when onProgress is supplied (regression guard)', async () => {
+    // The aggregated result.stdout/stderr fields must continue to reflect
+    // the full byte stream — onProgress is additive, not a replacement.
+    const result = await spawnSasArgs({
+      args: [
+        '--json',
+        JSON.stringify({
+          writes: [
+            { stream: 'stdout', text: 'hello\nworld', delayMs: 0 },
+            { stream: 'stderr', text: 'err1\n', delayMs: 0 },
+          ],
+        }),
+      ],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+      onProgress: () => {},
+    });
+    // .trim() is applied by the handler, but the joined content survives.
+    expect(result.stdout).toBe('hello\nworld');
+    expect(result.stderr).toBe('err1');
+  });
+
+  it('is a no-op when onProgress is omitted', async () => {
+    // Should still complete successfully; no callback to invoke.
+    const result = await spawnSasArgs({
+      args: [
+        '--json',
+        JSON.stringify({
+          writes: [{ stream: 'stdout', text: 'a\nb\n', delayMs: 0 }],
+        }),
+      ],
+      appExe: process.execPath,
+      cliEntry: stubPath,
+    });
+    expect(result.success).toBe(true);
+    expect(result.stdout).toBe('a\nb');
+  });
+});

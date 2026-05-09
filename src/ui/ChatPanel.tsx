@@ -160,9 +160,28 @@ function applyEvent(
   turnId: number
 ): TerminalEntry[] {
   switch (event.type) {
-    case 'tool_call_start':
+    case 'llm_call_start': {
+      // One thinking row at a time per turn — if one already exists for this
+      // turn, leave it (avoids stacking up rows when start fires multiple
+      // times before end).
+      const hasThinking = entries.some(
+        (e) => e.kind === 'thinking' && e.turnId === turnId
+      );
+      if (hasThinking) return entries;
       return [
         ...entries,
+        { kind: 'thinking', id: nextId(), turnId },
+      ];
+    }
+
+    case 'llm_call_end':
+      return removeThinking(entries, turnId);
+
+    case 'tool_call_start':
+      // Defensive: if llm_call_end was lost mid-flight, the thinking row
+      // would otherwise hang around once a tool starts. Strip it now.
+      return [
+        ...removeThinking(entries, turnId),
         {
           kind: 'tool_pending',
           id: nextId(),
@@ -170,6 +189,19 @@ function applyEvent(
           callId: event.callId,
           tool: event.toolName,
           params: event.toolArgs,
+        },
+      ];
+
+    case 'tool_progress':
+      return [
+        ...entries,
+        {
+          kind: 'tool_output_line',
+          id: nextId(),
+          turnId,
+          callId: event.callId,
+          stream: event.stream,
+          text: event.line,
         },
       ];
 
@@ -205,13 +237,14 @@ function applyEvent(
     }
 
     case 'final_text': {
-      const toolCount = entries.filter(
+      const cleaned = removeThinking(entries, turnId);
+      const toolCount = cleaned.filter(
         (e) =>
           (e.kind === 'tool_done' || e.kind === 'tool_pending') &&
           e.turnId === turnId
       ).length;
       return [
-        ...entries,
+        ...cleaned,
         {
           kind: 'assistant',
           id: nextId(),
@@ -224,12 +257,16 @@ function applyEvent(
     }
 
     case 'iteration_limit':
-      return entries.map((e) =>
+      return removeThinking(entries, turnId).map((e) =>
         e.kind === 'assistant' && e.turnId === turnId
           ? { ...e, iterationLimitHit: true }
           : e
       );
   }
+}
+
+function removeThinking(entries: TerminalEntry[], turnId: number): TerminalEntry[] {
+  return entries.filter((e) => !(e.kind === 'thinking' && e.turnId === turnId));
 }
 
 function collapseTurn(entries: TerminalEntry[], turnId: number): TerminalEntry[] {

@@ -61,7 +61,28 @@ export const TerminalLog: React.FC<TerminalLogProps> = ({
       collapsedTurns.add(e.turnId);
     }
   }
+
+  // Group tool_output_line entries by their tool's callId so the ToolRow
+  // can render them inline between the ⚡ header and the ↳ result. Without
+  // this, output lines visually appear AFTER the result (because tool_done
+  // replaces tool_pending in-place at the original array slot, while
+  // output_line entries are appended later).
+  const outputLinesByCallId = new Map<
+    string,
+    Array<Extract<TerminalEntry, { kind: 'tool_output_line' }>>
+  >();
+  for (const e of entries) {
+    if (e.kind === 'tool_output_line') {
+      const list = outputLinesByCallId.get(e.callId) ?? [];
+      list.push(e);
+      outputLinesByCallId.set(e.callId, list);
+    }
+  }
+
   const visibleEntries = entries.filter((e) => {
+    // Output lines never render at their natural array position — the
+    // owning ToolRow inlines them.
+    if (e.kind === 'tool_output_line') return false;
     if (e.kind !== 'tool_pending' && e.kind !== 'tool_done') return true;
     return !collapsedTurns.has(e.turnId);
   });
@@ -88,6 +109,7 @@ export const TerminalLog: React.FC<TerminalLogProps> = ({
           entry={entry}
           previous={i > 0 ? visibleEntries[i - 1] : null}
           onToggleTurn={onToggleTurn}
+          outputLinesByCallId={outputLinesByCallId}
         />
       ))}
       {isProcessing && <ProcessingCursor />}
@@ -103,9 +125,18 @@ interface EntryRowProps {
   entry: TerminalEntry;
   previous: TerminalEntry | null;
   onToggleTurn: (turnId: number) => void;
+  outputLinesByCallId: Map<
+    string,
+    Array<Extract<TerminalEntry, { kind: 'tool_output_line' }>>
+  >;
 }
 
-const EntryRow: React.FC<EntryRowProps> = ({ entry, previous, onToggleTurn }) => {
+const EntryRow: React.FC<EntryRowProps> = ({
+  entry,
+  previous,
+  onToggleTurn,
+  outputLinesByCallId,
+}) => {
   const spacing = needsTopSpacing(entry, previous) ? 8 : 0;
 
   switch (entry.kind) {
@@ -114,6 +145,17 @@ const EntryRow: React.FC<EntryRowProps> = ({ entry, previous, onToggleTurn }) =>
         <div data-role="user" style={{ marginTop: spacing }}>
           <span style={{ color: COLOR.prompt }}>{'> '}</span>
           <span style={{ color: COLOR.user }}>{entry.text}</span>
+        </div>
+      );
+
+    case 'thinking':
+      return (
+        <div
+          data-role="thinking"
+          aria-live="polite"
+          style={{ marginTop: spacing, color: COLOR.muted, opacity: 0.55 }}
+        >
+          <span className="sas-chat-blink">{'  ~ thinking ~'}</span>
         </div>
       );
 
@@ -128,11 +170,38 @@ const EntryRow: React.FC<EntryRowProps> = ({ entry, previous, onToggleTurn }) =>
           }}
           pending
           spacing={spacing}
+          progressLines={outputLinesByCallId.get(entry.callId) ?? []}
         />
       );
 
+    case 'tool_output_line':
+      // Defensive — should be filtered out before reaching here. If a
+      // future refactor stops filtering, render as a fallback so we don't
+      // silently lose data.
+      return (
+        <div
+          data-role="tool-output"
+          data-stream={entry.stream}
+          style={{
+            marginTop: spacing,
+            color: entry.stream === 'stderr' ? COLOR.error : COLOR.muted,
+            opacity: 0.7,
+          }}
+        >
+          {'    ┊ '}
+          {entry.text}
+        </div>
+      );
+
     case 'tool_done':
-      return <ToolRow entry={entry} pending={false} spacing={spacing} />;
+      return (
+        <ToolRow
+          entry={entry}
+          pending={false}
+          spacing={spacing}
+          progressLines={outputLinesByCallId.get(entry.callId) ?? []}
+        />
+      );
 
     case 'assistant':
       if (entry.collapsed && entry.toolCount > 0) {
@@ -170,9 +239,15 @@ interface ToolRowProps {
   entry: Extract<TerminalEntry, { kind: 'tool_done' }>;
   pending: boolean;
   spacing: number;
+  progressLines: Array<Extract<TerminalEntry, { kind: 'tool_output_line' }>>;
 }
 
-const ToolRow: React.FC<ToolRowProps> = ({ entry, pending, spacing }) => {
+const ToolRow: React.FC<ToolRowProps> = ({
+  entry,
+  pending,
+  spacing,
+  progressLines,
+}) => {
   const paramStr = formatParams(entry.params);
   const isError = entry.error !== undefined;
   const resultText = pending
@@ -189,6 +264,25 @@ const ToolRow: React.FC<ToolRowProps> = ({ entry, pending, spacing }) => {
           <span style={{ color: COLOR.muted }}>{' ' + paramStr}</span>
         )}
       </div>
+      {progressLines.map((line) => (
+        <div
+          key={line.id}
+          data-role="tool-output"
+          data-stream={line.stream}
+          style={{
+            color: line.stream === 'stderr' ? COLOR.error : COLOR.muted,
+            opacity: 0.7,
+          }}
+        >
+          {'    ┊ '}
+          {line.text}
+        </div>
+      ))}
+      {pending && (
+        <div data-role="tool-running" style={{ color: COLOR.muted, opacity: 0.55 }}>
+          <span className="sas-chat-blink">{'    ⊙ running...'}</span>
+        </div>
+      )}
       {!pending && (
         <div>
           <span style={{ color: isError ? COLOR.error : COLOR.muted }}>
@@ -264,5 +358,6 @@ function needsTopSpacing(entry: TerminalEntry, previous: TerminalEntry | null): 
   if (entry.kind === 'user') return true;
   if (entry.kind === 'assistant') return true;
   if (entry.kind === 'system_error') return true;
+  // thinking + tool_output_line attach tightly to whatever came before.
   return false;
 }

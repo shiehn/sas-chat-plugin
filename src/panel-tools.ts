@@ -60,7 +60,7 @@ export async function buildPanelTools(
   );
   const activeSceneId = host.getActiveSceneId();
 
-  const executor: ToolExecutor = async (name, args) => {
+  const executor: ToolExecutor = async (name, args, onProgress) => {
     const def = toolByName.get(name);
     if (!def) {
       // Unknown tool — feed back a structured failure so the model can
@@ -80,6 +80,7 @@ export async function buildPanelTools(
       params,
       appExe: cliPaths.appExe,
       cliEntry: cliPaths.cliEntry,
+      onProgress,
     });
   };
 

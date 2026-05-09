@@ -18,6 +18,12 @@
 
 import { spawn } from 'node:child_process';
 
+/** One newline-delimited line from the spawned CLI's stdout/stderr. */
+export interface SasProgressChunk {
+  stream: 'stdout' | 'stderr';
+  line: string;
+}
+
 export interface SasToolInvocation {
   /** sas CLI action name, e.g. 'scene_get_tracks'. */
   action: string;
@@ -29,6 +35,12 @@ export interface SasToolInvocation {
   cliEntry: string;
   /** Per-call timeout. Default 60s. */
   timeoutMs?: number;
+  /**
+   * Fires once per newline-delimited line from stdout/stderr as it arrives.
+   * Additive — the final result.stdout/stderr accumulators are unchanged.
+   * Optional: long-running tools call frequently; short tools may never call.
+   */
+  onProgress?: (chunk: SasProgressChunk) => void;
 }
 
 /**
@@ -52,6 +64,12 @@ export interface SasArgsInvocation {
   timeoutMs?: number;
   /** Optional abort signal — kills the child with SIGTERM when triggered. */
   signal?: AbortSignal;
+  /**
+   * Fires once per newline-delimited line from stdout/stderr as it arrives.
+   * Additive — the final result.stdout/stderr accumulators are unchanged.
+   * Optional: long-running tools call frequently; short tools may never call.
+   */
+  onProgress?: (chunk: SasProgressChunk) => void;
 }
 
 export interface SasToolResult {
@@ -133,6 +151,30 @@ export async function spawnSasArgs(invocation: SasArgsInvocation): Promise<SasTo
     let aborted = false;
     let settled = false;
 
+    // Line-split buffer per stream so `onProgress` fires once per logical
+    // line. Tools that want progress visible to the user MUST terminate
+    // each message with `\n` — anything left un-terminated at close is by
+    // definition the tool's final result blob, which the caller already
+    // gets via the resolved promise. Re-surfacing it as a progress line
+    // would just duplicate the `↳ result` row in the UI.
+    const lineBuffers: Record<'stdout' | 'stderr', string> = {
+      stdout: '',
+      stderr: '',
+    };
+    const flushLines = (stream: 'stdout' | 'stderr', chunkText: string): void => {
+      if (!invocation.onProgress) return;
+      const combined = lineBuffers[stream] + chunkText;
+      const parts = combined.split('\n');
+      // Last element is whatever followed the final \n — held as a partial
+      // until the next chunk completes the line. If close arrives first,
+      // it's discarded (see comment above).
+      const partial = parts.pop() ?? '';
+      for (const line of parts) {
+        invocation.onProgress({ stream, line });
+      }
+      lineBuffers[stream] = partial;
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
       try {
@@ -159,10 +201,14 @@ export async function spawnSasArgs(invocation: SasArgsInvocation): Promise<SasTo
     }
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      flushLines('stdout', text);
     });
     child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      flushLines('stderr', text);
     });
 
     child.on('error', (err) => {
@@ -229,5 +275,6 @@ export async function invokeSas(invocation: SasToolInvocation): Promise<SasToolR
     appExe: invocation.appExe,
     cliEntry: invocation.cliEntry,
     timeoutMs: invocation.timeoutMs,
+    onProgress: invocation.onProgress,
   });
 }

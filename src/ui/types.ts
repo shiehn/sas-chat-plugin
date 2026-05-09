@@ -10,12 +10,25 @@
 export type TerminalEntry =
   | { kind: 'user'; id: string; turnId: number; text: string }
   | {
+      kind: 'thinking';
+      id: string;
+      turnId: number;
+    }
+  | {
       kind: 'tool_pending';
       id: string;
       turnId: number;
       callId: string;
       tool: string;
       params: Record<string, unknown>;
+    }
+  | {
+      kind: 'tool_output_line';
+      id: string;
+      turnId: number;
+      callId: string;
+      stream: 'stdout' | 'stderr';
+      text: string;
     }
   | {
       kind: 'tool_done';

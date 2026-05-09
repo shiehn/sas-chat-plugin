@@ -113,7 +113,11 @@ describe('AgentLoop', () => {
     expect(result.iterations).toBe(1);
     expect(result.iterationLimitHit).toBe(false);
     expect(executor).not.toHaveBeenCalled();
-    expect(events.map((e) => e.type)).toEqual(['final_text']);
+    expect(events.map((e) => e.type)).toEqual([
+      'llm_call_start',
+      'llm_call_end',
+      'final_text',
+    ]);
   });
 
   it('dispatches tool calls and feeds responses back into the loop', async () => {
@@ -142,12 +146,17 @@ describe('AgentLoop', () => {
 
     expect(result.text).toBe('There are 2 tracks.');
     expect(result.iterations).toBe(2);
-    expect(executor).toHaveBeenCalledWith('scene_get_tracks', {});
+    expect(executor).toHaveBeenCalledWith('scene_get_tracks', {}, expect.any(Function));
 
-    // Event sequence: start → done → final_text
+    // Event sequence: turn 1 wraps an llm call + the tool call,
+    // turn 2 wraps a second llm call → final_text.
     expect(events.map((e) => e.type)).toEqual([
+      'llm_call_start',
+      'llm_call_end',
       'tool_call_start',
       'tool_call_done',
+      'llm_call_start',
+      'llm_call_end',
       'final_text',
     ]);
 
@@ -602,6 +611,103 @@ describe('AgentLoop', () => {
     };
     expect(thirdCall.contents).toHaveLength(1);
     expect(thirdCall.contents[0].parts[0].text).toBe('next request');
+  });
+
+  it('emits llm_call_start before generateWithLLMTools and llm_call_end after (success path)', async () => {
+    const host = makeScriptedHost([textResponse('hi')]);
+    const events: AgentLoopEvent[] = [];
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: jest.fn(),
+      systemPrompt: SYSTEM_PROMPT,
+      onEvent: (e) => events.push(e),
+    });
+
+    await loop.run('hello');
+
+    const types = events.map((e) => e.type);
+    const startIdx = types.indexOf('llm_call_start');
+    const endIdx = types.indexOf('llm_call_end');
+    expect(startIdx).toBeGreaterThanOrEqual(0);
+    expect(endIdx).toBeGreaterThan(startIdx);
+    // both events report the same iteration number
+    const startEvt = events[startIdx];
+    const endEvt = events[endIdx];
+    if (startEvt.type === 'llm_call_start' && endEvt.type === 'llm_call_end') {
+      expect(startEvt.iteration).toBe(1);
+      expect(endEvt.iteration).toBe(1);
+    }
+  });
+
+  it('emits llm_call_end even when generateWithLLMTools throws', async () => {
+    const boom = new Error('LLM unreachable');
+    const host = {
+      generateWithLLMTools: jest.fn().mockRejectedValue(boom) as jest.Mock,
+    };
+    const events: AgentLoopEvent[] = [];
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: jest.fn(),
+      systemPrompt: SYSTEM_PROMPT,
+      onEvent: (e) => events.push(e),
+    });
+
+    await expect(loop.run('hi')).rejects.toThrow(/LLM unreachable/);
+    const types = events.map((e) => e.type);
+    expect(types).toContain('llm_call_start');
+    expect(types).toContain('llm_call_end');
+    // start must precede end even on the error path
+    expect(types.indexOf('llm_call_end')).toBeGreaterThan(
+      types.indexOf('llm_call_start')
+    );
+  });
+
+  it('forwards executor onProgress as tool_progress events tagged with the live callId', async () => {
+    const host = makeScriptedHost([
+      toolCallResponse('compose_scene', {}),
+      textResponse('done'),
+    ]);
+    // Capture progress chunks as the executor invokes them; respond synchronously.
+    const executor: ToolExecutor = jest
+      .fn()
+      .mockImplementation(async (_name, _args, onProgress) => {
+        onProgress?.({ stream: 'stdout', line: 'loading synth...' });
+        onProgress?.({ stream: 'stderr', line: 'warning: slow disk' });
+        onProgress?.({ stream: 'stdout', line: 'done' });
+        return { success: true, exitCode: 0, stdout: '{}', stderr: '' };
+      });
+
+    const events: AgentLoopEvent[] = [];
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      onEvent: (e) => events.push(e),
+    });
+    await loop.run('compose');
+
+    const startEvt = events.find((e) => e.type === 'tool_call_start');
+    const progress = events.filter((e) => e.type === 'tool_progress');
+    expect(startEvt).toBeDefined();
+    expect(progress).toHaveLength(3);
+    if (startEvt && startEvt.type === 'tool_call_start') {
+      for (const p of progress) {
+        if (p.type === 'tool_progress') {
+          expect(p.callId).toBe(startEvt.callId);
+          expect(p.iteration).toBe(1);
+        }
+      }
+    }
+    const lines = progress.map((p) => (p.type === 'tool_progress' ? p.line : ''));
+    expect(lines).toEqual(['loading synth...', 'warning: slow disk', 'done']);
+    const streams = progress.map((p) => (p.type === 'tool_progress' ? p.stream : ''));
+    expect(streams).toEqual(['stdout', 'stderr', 'stdout']);
   });
 
   it('refuses concurrent run() calls', async () => {

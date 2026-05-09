@@ -376,4 +376,267 @@ describe('ChatPanel (terminal log)', () => {
       expect(screen.getByText(/iteration limit/i)).not.toBeNull();
     });
   });
+
+  describe('thinking indicator', () => {
+    it('inserts a thinking row on llm_call_start and removes it on llm_call_end', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          })
+      );
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('hi');
+      });
+
+      // Before llm_call_start: no thinking row.
+      expect(screen.queryByText(/thinking/)).toBeNull();
+
+      // After llm_call_start: a thinking row is visible.
+      act(() => {
+        capturedOnEvent({ type: 'llm_call_start', iteration: 1 });
+      });
+      expect(screen.getByText(/thinking/)).not.toBeNull();
+
+      // After llm_call_end: it's gone again.
+      act(() => {
+        capturedOnEvent({ type: 'llm_call_end', iteration: 1 });
+      });
+      expect(screen.queryByText(/thinking/)).toBeNull();
+
+      // Wrap up the turn cleanly so the test doesn't leak a pending promise.
+      act(() => {
+        capturedOnEvent({ type: 'final_text', iterations: 1, text: 'ok' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'ok', actions: [] });
+      });
+    });
+
+    it('does not stack thinking rows when llm_call_start fires twice in a row', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          })
+      );
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('hi');
+      });
+
+      act(() => {
+        capturedOnEvent({ type: 'llm_call_start', iteration: 1 });
+        capturedOnEvent({ type: 'llm_call_start', iteration: 1 });
+      });
+      // Only one thinking element should exist for this turn.
+      expect(screen.getAllByText(/thinking/)).toHaveLength(1);
+
+      act(() => {
+        capturedOnEvent({ type: 'final_text', iterations: 1, text: 'ok' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'ok', actions: [] });
+      });
+    });
+
+    it('strips a lingering thinking row when tool_call_start arrives', async () => {
+      // Defensive case: llm_call_end is dropped (e.g., IPC reorder); the
+      // arrival of a tool call must clear the thinking indicator.
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          })
+      );
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('list');
+      });
+
+      act(() => {
+        capturedOnEvent({ type: 'llm_call_start', iteration: 1 });
+        capturedOnEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'get_tracks',
+          toolArgs: {},
+        });
+      });
+      expect(screen.queryByText(/thinking/)).toBeNull();
+      expect(screen.getByText('get_tracks')).not.toBeNull();
+
+      act(() => {
+        capturedOnEvent(toolDoneSuccess(1, 'c1', 'get_tracks', {}, ''));
+        capturedOnEvent({ type: 'final_text', iterations: 1, text: 'done' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'done', actions: [] });
+      });
+    });
+  });
+
+  describe('running indicator', () => {
+    it('shows "running..." under a pending tool until tool_call_done arrives', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          })
+      );
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('compose');
+      });
+
+      // No pending tools yet — no running indicator.
+      expect(screen.queryByText(/running/)).toBeNull();
+
+      // tool_call_start → running indicator visible.
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'compose_scene',
+          toolArgs: {},
+        });
+      });
+      expect(screen.getByText(/running/)).not.toBeNull();
+
+      // tool_call_done → running indicator gone, ↳ result row visible.
+      act(() => {
+        capturedOnEvent(toolDoneSuccess(1, 'c1', 'compose_scene', {}, '{}'));
+      });
+      expect(screen.queryByText(/running/)).toBeNull();
+      expect(screen.getByText(/↳/)).not.toBeNull();
+
+      act(() => {
+        capturedOnEvent({ type: 'final_text', iterations: 1, text: 'ok' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'ok', actions: [] });
+      });
+    });
+  });
+
+  describe('tool_progress streaming', () => {
+    it('renders streamed CLI lines under the pending tool with the matching callId', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          })
+      );
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('compose');
+      });
+
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'compose_scene',
+          toolArgs: {},
+        });
+        capturedOnEvent({
+          type: 'tool_progress',
+          iteration: 1,
+          callId: 'c1',
+          stream: 'stdout',
+          line: 'loading synth...',
+        });
+        capturedOnEvent({
+          type: 'tool_progress',
+          iteration: 1,
+          callId: 'c1',
+          stream: 'stderr',
+          line: 'warn: slow disk',
+        });
+      });
+
+      expect(screen.getByText(/loading synth/)).not.toBeNull();
+      expect(screen.getByText(/slow disk/)).not.toBeNull();
+
+      // Output lines persist across tool_call_done — they're scrollback,
+      // not just an in-flight indicator.
+      act(() => {
+        capturedOnEvent(toolDoneSuccess(1, 'c1', 'compose_scene', {}, '{}'));
+      });
+      expect(screen.getByText(/loading synth/)).not.toBeNull();
+      expect(screen.getByText(/slow disk/)).not.toBeNull();
+
+      act(() => {
+        capturedOnEvent({ type: 'final_text', iterations: 1, text: 'ok' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'ok', actions: [] });
+      });
+    });
+
+    it('collapses output lines together with tool rows after a clean turn', async () => {
+      sendFn.mockImplementation(async (_msg, onEvent) => {
+        onEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'compose_scene',
+          toolArgs: {},
+        });
+        onEvent({
+          type: 'tool_progress',
+          iteration: 1,
+          callId: 'c1',
+          stream: 'stdout',
+          line: 'midline log',
+        });
+        onEvent(toolDoneSuccess(1, 'c1', 'compose_scene', {}, '{}'));
+        onEvent({ type: 'final_text', iterations: 1, text: 'done' });
+        return { text: 'done', actions: [] };
+      });
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('go');
+      });
+
+      // After collapse, output lines and tool rows are both hidden.
+      await waitFor(() => {
+        expect(screen.queryByText('compose_scene')).toBeNull();
+        expect(screen.queryByText(/midline log/)).toBeNull();
+      });
+
+      // Re-expand and they reappear.
+      const summary = screen.getByText(/1 tool call/);
+      await act(async () => {
+        fireEvent.click(summary);
+      });
+      expect(screen.getByText('compose_scene')).not.toBeNull();
+      expect(screen.getByText(/midline log/)).not.toBeNull();
+    });
+  });
 });
