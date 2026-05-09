@@ -50,26 +50,25 @@ export interface SasToolResult {
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 /**
- * Convert a parameters object to bare-KV CLI args. The CLI accepts both
- * `--name value` and `name=value` forms; we use bare-KV because it's the
- * agent-legible form the CLI was deliberately tuned for (commit `e3fa9b5e`
- * made `name=value` first-class for agent consumption).
+ * Convert a parameters object to CLI args using the `--json '{...}'`
+ * escape hatch.
  *
- * Strings/numbers/booleans are stringified directly. Nested objects/arrays
- * are JSON-encoded (the CLI's argv parser handles that).
+ * The active CLI (`sas-assistant/cli/sas.ts`) parses `--key value` and
+ * `--json '{...}'`, but NOT bare `key=value` positionals — those land in
+ * `positionals[]` and never reach `params`. Earlier versions of this
+ * function emitted bare-KV form which silently dropped every argument
+ * the model passed (e.g. compose_scene's `tracks=[...]` arrived as an
+ * empty params object → "non-empty tracks array" error).
+ *
+ * Using `--json` is also the most robust path for nested objects and
+ * arrays: the CLI does `JSON.parse(value)` and merges the result into
+ * params verbatim, so types round-trip without any per-argv coercion.
  *
  * Exported for unit-test coverage.
  */
 export function paramsToCliArgs(params: Record<string, unknown>): string[] {
-  return Object.entries(params).map(([key, value]) => {
-    if (value === null || value === undefined) {
-      return `${key}=`;
-    }
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      return `${key}=${String(value)}`;
-    }
-    return `${key}=${JSON.stringify(value)}`;
-  });
+  if (Object.keys(params).length === 0) return [];
+  return ['--json', JSON.stringify(params)];
 }
 
 /**

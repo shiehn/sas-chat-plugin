@@ -18,30 +18,37 @@ import { invokeSas, paramsToCliArgs } from '../sas-tool-handler';
 // ---------------------------------------------------------------------------
 
 describe('paramsToCliArgs', () => {
-  it('serializes strings, numbers, and booleans as bare-KV', () => {
+  it('emits --json with a JSON-encoded payload for primitive params', () => {
     expect(paramsToCliArgs({ name: 'Bass', volume: 0.8, mute: true })).toEqual([
-      'name=Bass',
-      'volume=0.8',
-      'mute=true',
+      '--json',
+      JSON.stringify({ name: 'Bass', volume: 0.8, mute: true }),
     ]);
   });
 
-  it('serializes objects and arrays as JSON', () => {
-    expect(
-      paramsToCliArgs({ pattern: { kick: [1, 0, 1, 0] } })
-    ).toEqual(['pattern={"kick":[1,0,1,0]}']);
+  it('round-trips nested objects and arrays through JSON', () => {
+    const params = {
+      tracks: [
+        { name: 'Kick', role: 'drums', prompt: 'four on the floor' },
+        { name: 'Bass', role: 'bass', prompt: 'walking' },
+      ],
+    };
+    const args = paramsToCliArgs(params);
+    expect(args[0]).toBe('--json');
+    expect(JSON.parse(args[1]!)).toEqual(params);
   });
 
-  it('serializes null and undefined as empty values', () => {
-    expect(paramsToCliArgs({ a: null, b: undefined })).toEqual(['a=', 'b=']);
-  });
-
-  it('produces a stable order matching insertion', () => {
-    expect(paramsToCliArgs({ z: 1, a: 2, m: 3 })).toEqual([
-      'z=1',
-      'a=2',
-      'm=3',
+  it('preserves null and undefined keys verbatim through JSON', () => {
+    // JSON.stringify drops `undefined` fields and keeps `null` — that's the
+    // documented contract; downstream tools should distinguish "not provided"
+    // (undefined) from "explicit null" using JSON's native rules.
+    expect(paramsToCliArgs({ a: null, b: undefined })).toEqual([
+      '--json',
+      '{"a":null}',
     ]);
+  });
+
+  it('returns an empty arg list when no params are passed', () => {
+    expect(paramsToCliArgs({})).toEqual([]);
   });
 });
 
@@ -66,22 +73,21 @@ describe('invokeSas — subprocess behavior', () => {
     fs.writeFileSync(
       stubPath,
       `
+      // Stub mirrors the active CLI's argv contract: \`<action> --json '<...>'\`.
+      // \`__exit_code\` / \`__stderr\` / \`__sleep_ms\` are test sentinels read off
+      // the parsed params object so individual tests can drive the stub.
       const args = process.argv.slice(2);
       const action = args[0];
-      const params = {};
-      let exitCode = 0;
-      let stderr = '';
-      let sleepMs = 0;
-      for (const arg of args.slice(1)) {
-        const eq = arg.indexOf('=');
-        if (eq < 0) continue;
-        const key = arg.slice(0, eq);
-        const val = arg.slice(eq + 1);
-        if (key === '__exit_code') { exitCode = Number(val); continue; }
-        if (key === '__stderr') { stderr = val; continue; }
-        if (key === '__sleep_ms') { sleepMs = Number(val); continue; }
-        params[key] = val;
+      let params = {};
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === '--json' && i + 1 < args.length) {
+          try { params = JSON.parse(args[i + 1]); } catch {}
+          i++;
+        }
       }
+      const exitCode = Number(params.__exit_code ?? 0);
+      const stderr = String(params.__stderr ?? '');
+      const sleepMs = Number(params.__sleep_ms ?? 0);
       const finish = () => {
         if (stderr.length > 0) process.stderr.write(stderr);
         process.stdout.write(JSON.stringify({ action, params }));
