@@ -11,7 +11,7 @@
  *   - events emitted in order
  */
 
-import { AgentLoop, truncateForLLM, type AgentLoopEvent, type ToolExecutor } from '../agent-loop';
+import { AgentLoop, truncateForLLM, type AgentLoopEvent, type ToolExecutor, type ToolExecutionResult } from '../agent-loop';
 import type { LLMTool, LLMToolUseResponse } from '@signalsandsorcery/plugin-sdk';
 
 // ---------------------------------------------------------------------------
@@ -530,6 +530,111 @@ describe('AgentLoop', () => {
     // Head and tail should both be present (structure-preserving truncation).
     expect(stdout.startsWith('A')).toBe(true);
     expect(stdout.endsWith('A')).toBe(true);
+  });
+
+  it('defers reset() requests that arrive while a run is in flight (scene-change race)', async () => {
+    /**
+     * Regression test for a Gemini "function response turn comes immediately
+     * after a function call turn" 400 observed in production on 2026-05-09.
+     *
+     * The chat-plugin's `onSceneChanged` calls `agent.reset()` on scene change.
+     * Tool calls that activate a new scene (e.g. `compose_scene`) trip this
+     * handler *while the AgentLoop is still inside* `await toolExecutor(...)`.
+     * Without deferral, reset() empties `this.contents` mid-flight, so when
+     * the tool finishes and run() pushes the user-funcResp turn, the loop's
+     * iter 2 sends a single content `[user-funcResp]` with no preceding
+     * `[user, model(toolCall)]` — exactly the shape Gemini rejects.
+     *
+     * The fix: reset() during a live run() defers to a finally{} block.
+     * Concretely, this test simulates the race by calling reset() from
+     * inside the toolExecutor callback (the same point where a real scene
+     * change would fire).
+     */
+    const host = makeScriptedHost([
+      toolCallResponse('compose_scene', { description: 'A simple beat' }),
+      textResponse('Composed.'),
+    ]);
+
+    let loopRef: AgentLoop | null = null;
+    const executor: ToolExecutor = jest.fn().mockImplementation(async () => {
+      // Mid-flight reset — same shape as onSceneChanged firing during tool exec.
+      loopRef!.reset();
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: JSON.stringify({ success: true }),
+        stderr: '',
+      };
+    });
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+    loopRef = loop;
+
+    const result = await loop.run('make a beat');
+    expect(result.text).toBe('Composed.');
+    expect(result.iterations).toBe(2);
+
+    // Iter 2 must carry [user, model(toolCall), user(funcResp)] — three turns,
+    // not just the lone funcResp. This is the exact symptom the bug produced.
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: Array<{ role: string; parts: Array<{ text?: string; functionCall?: unknown; functionResponse?: unknown }> }>;
+    };
+    expect(secondCall.contents).toHaveLength(3);
+    expect(secondCall.contents[0]).toMatchObject({
+      role: 'user',
+      parts: [{ text: 'make a beat' }],
+    });
+    expect(secondCall.contents[1].role).toBe('model');
+    expect(secondCall.contents[1].parts[0]).toHaveProperty('functionCall');
+    expect(secondCall.contents[2].role).toBe('user');
+    expect(secondCall.contents[2].parts[0]).toHaveProperty('functionResponse');
+
+    // After run() returns, the deferred reset has applied — next run() starts fresh.
+    await loop.run('next request');
+    const thirdCall = host.generateWithLLMTools.mock.calls[2][0] as {
+      contents: Array<{ role: string; parts: Array<{ text?: string }> }>;
+    };
+    expect(thirdCall.contents).toHaveLength(1);
+    expect(thirdCall.contents[0].parts[0].text).toBe('next request');
+  });
+
+  it('refuses concurrent run() calls', async () => {
+    /** Defensive: if someone fires two run()s in parallel (UI guard bypassed),
+     *  surface the violation instead of corrupting `this.contents`. */
+    const host = makeScriptedHost([
+      toolCallResponse('compose_scene', {}),
+      textResponse('done'),
+    ]);
+    let resolveExecutor: (() => void) | undefined;
+    const executor: ToolExecutor = jest.fn().mockImplementation(
+      () =>
+        new Promise<ToolExecutionResult>((resolve) => {
+          resolveExecutor = () =>
+            resolve({ success: true, exitCode: 0, stdout: '{}', stderr: '' });
+        })
+    );
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+
+    const firstRun = loop.run('first');
+    // Wait for the loop to enter the toolExecutor await.
+    await new Promise((r) => setTimeout(r, 10));
+    await expect(loop.run('second')).rejects.toThrow(/already in flight|previous run/);
+
+    resolveExecutor!();
+    await firstRun;
   });
 });
 

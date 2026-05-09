@@ -117,6 +117,17 @@ export class AgentLoop {
 
   private contents: LLMContent[] = [];
   private callIdCounter = 0;
+  /** True while `run()` is mid-flight. Guards against external `reset()` calls
+   *  (e.g. from the chat-plugin's `onSceneChanged` handler) clearing
+   *  conversation history while a tool is executing — without this, iter 2
+   *  fires with `contents = [user-funcResp]` only, which Gemini rejects with
+   *  the misleading "function response turn comes immediately after a function
+   *  call turn" error. The trigger is real-world: any tool call that creates
+   *  and activates a new scene (e.g. `compose_scene`) re-enters the host's
+   *  scene-change broadcast while the loop is still awaiting tool completion. */
+  private isRunning = false;
+  /** A reset() request that arrived while running; applied at run end. */
+  private pendingReset = false;
 
   constructor(options: AgentLoopOptions) {
     this.host = options.host;
@@ -128,8 +139,14 @@ export class AgentLoop {
     this.onEvent = options.onEvent;
   }
 
-  /** Drop conversation history (called on scene change). */
+  /** Drop conversation history (called on scene change). Defers if a run is
+   *  in flight so we don't tear out [user, model(toolCall)] state while a
+   *  toolExecutor is awaiting — see `isRunning` field comment. */
   reset(): void {
+    if (this.isRunning) {
+      this.pendingReset = true;
+      return;
+    }
     this.contents = [];
   }
 
@@ -152,6 +169,31 @@ export class AgentLoop {
       }
     };
 
+    if (this.isRunning) {
+      // Concurrent run() call. The chat panel guards against this by disabling
+      // the input box mid-send, but be defensive — surface the violation
+      // instead of corrupting `this.contents` with interleaved turns.
+      throw new Error(
+        'AgentLoop.run() called while a previous run is still in flight'
+      );
+    }
+
+    this.isRunning = true;
+    try {
+      return await this._runInner(userMessage, emit);
+    } finally {
+      this.isRunning = false;
+      if (this.pendingReset) {
+        this.pendingReset = false;
+        this.contents = [];
+      }
+    }
+  }
+
+  private async _runInner(
+    userMessage: string,
+    emit: (event: AgentLoopEvent) => void
+  ): Promise<AgentLoopResult> {
     this.contents.push({
       role: 'user',
       parts: [{ text: userMessage }],
