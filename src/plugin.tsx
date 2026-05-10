@@ -114,7 +114,12 @@ When to ask vs proceed:
 - ONLY call \`ask_user\` when the request is genuinely ambiguous AND a wrong guess would cost real work. Examples: multiple equally-valid candidates ("the bass" with three bass tracks of different roles), missing a load-bearing parameter ("shorten the intro" with no scene specified), an interpretation that would overwrite user intent.
 - When you do ask, keep the question focused (one sentence) and pass an \`options\` array of 2–4 candidates whenever you can enumerate them — the UI renders quick-reply buttons.
 - Do not ask to confirm tool calls you've already decided to make. Do not ask "are you sure?" — destructive operations are reversible.
-- If a request is out of scope, say so plainly and suggest what the user could do instead. Don't use \`ask_user\` for scope rejection.`;
+- If a request is out of scope, say so plainly and suggest what the user could do instead. Don't use \`ask_user\` for scope rejection.
+
+Don't give up without making a call:
+- If your default tool list doesn't have an exact match, your FIRST move is \`tool_search\` with a keyword from the user's ask (deck, transition, audio, route, project, export, history, …) — NOT a text reply saying "I can't do that".
+- If after \`tool_search\` you still don't see a perfect match, call the closest tool and report what actually happened in your reply. The user can hear/see the result and correct course.
+- Replying with plain text and zero tool calls is reserved for: pure read-back questions the user already gave you the answer to ("what was that command again?"), out-of-scope rejections, and final summaries after at least one tool call landed.`;
 
 // -----------------------------------------------------------------------------
 // Renderer-side UI — proxies user messages to the main-process plugin via IPC.
