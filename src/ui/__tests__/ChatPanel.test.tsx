@@ -538,6 +538,246 @@ describe('ChatPanel (terminal log)', () => {
     });
   });
 
+  describe('ask_user clarification flow', () => {
+    it('renders a styled question entry on tool_call_start with toolName=ask_user, with quick-reply buttons when options are provided', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          }),
+      );
+
+      const sendClarification = jest.fn<(r: string) => Promise<void>>().mockResolvedValue();
+      render(
+        <ChatPanel
+          sendMessage={sendFn}
+          sendClarificationResponse={sendClarification}
+        />,
+      );
+
+      await act(async () => {
+        typeAndSend('boost the bass with reverb');
+      });
+
+      // Model fires ask_user with options.
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: {
+            question: 'Which bass: track 2 or track 5?',
+            options: ['track 2', 'track 5'],
+          },
+        });
+      });
+
+      // Question is visible…
+      expect(screen.getByText(/Which bass/)).not.toBeNull();
+      // …with quick-reply buttons.
+      const opt1 = screen.getByRole('button', { name: 'track 2' });
+      const opt2 = screen.getByRole('button', { name: 'track 5' });
+      expect(opt1).not.toBeNull();
+      expect(opt2).not.toBeNull();
+
+      // Input box re-enables for the user to type a reply.
+      const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(textarea.disabled).toBe(false);
+
+      // Wrap up the test loop.
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_done',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: {
+            question: 'Which bass: track 2 or track 5?',
+            options: ['track 2', 'track 5'],
+          },
+          result: { success: true, exitCode: 0, stdout: 'track 2', stderr: '' },
+        });
+        capturedOnEvent({ type: 'final_text', iterations: 2, text: 'Done.' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'Done.', actions: [] });
+      });
+    });
+
+    it('routes the user\'s typed reply through sendClarificationResponse instead of starting a new turn', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          }),
+      );
+
+      const sendClarification = jest.fn<(r: string) => Promise<void>>().mockResolvedValue();
+      render(
+        <ChatPanel
+          sendMessage={sendFn}
+          sendClarificationResponse={sendClarification}
+        />,
+      );
+
+      await act(async () => {
+        typeAndSend('do it');
+      });
+
+      // Question fires; pending state is set.
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: { question: 'which scene?' },
+        });
+      });
+
+      // User types the reply.
+      await act(async () => {
+        typeAndSend('the intro scene');
+      });
+
+      // It went to sendClarificationResponse, NOT to sendMessage (no second turn).
+      expect(sendClarification).toHaveBeenCalledWith('the intro scene');
+      expect(sendFn).toHaveBeenCalledTimes(1);
+
+      // Wrap the loop.
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_done',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: { question: 'which scene?' },
+          result: { success: true, exitCode: 0, stdout: 'the intro scene', stderr: '' },
+        });
+        capturedOnEvent({ type: 'final_text', iterations: 2, text: 'Done.' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'Done.', actions: [] });
+      });
+    });
+
+    it('routes a quick-reply button click through sendClarificationResponse with the option text', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          }),
+      );
+
+      const sendClarification = jest.fn<(r: string) => Promise<void>>().mockResolvedValue();
+      render(
+        <ChatPanel
+          sendMessage={sendFn}
+          sendClarificationResponse={sendClarification}
+        />,
+      );
+
+      await act(async () => {
+        typeAndSend('boost the bass');
+      });
+
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: {
+            question: 'which one?',
+            options: ['track 2', 'track 5'],
+          },
+        });
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'track 5' }));
+      });
+
+      expect(sendClarification).toHaveBeenCalledWith('track 5');
+
+      // Wrap the loop.
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_done',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: { question: 'which one?' },
+          result: { success: true, exitCode: 0, stdout: 'track 5', stderr: '' },
+        });
+        capturedOnEvent({ type: 'final_text', iterations: 2, text: 'Done.' });
+      });
+      await act(async () => {
+        resolveSend({ text: 'Done.', actions: [] });
+      });
+    });
+
+    it('clears the pending clarification on tool_call_done failure and surfaces a system_error', async () => {
+      let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};
+      let resolveSend: (v: ChatPanelResponse) => void = () => {};
+      sendFn.mockImplementation(
+        (_msg, onEvent) =>
+          new Promise<ChatPanelResponse>((resolve) => {
+            capturedOnEvent = onEvent;
+            resolveSend = resolve;
+          }),
+      );
+
+      render(<ChatPanel sendMessage={sendFn} sendClarificationResponse={jest.fn()} />);
+
+      await act(async () => {
+        typeAndSend('hi');
+      });
+
+      act(() => {
+        capturedOnEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: { question: 'pick one' },
+        });
+        capturedOnEvent({
+          type: 'tool_call_done',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'ask_user',
+          toolArgs: { question: 'pick one' },
+          result: {
+            success: false,
+            exitCode: 1,
+            stdout: '',
+            stderr: 'user closed the panel',
+          },
+        });
+        capturedOnEvent({ type: 'final_text', iterations: 2, text: 'ok' });
+      });
+
+      // Question entry replaced by a system_error.
+      expect(screen.getByText(/Clarification cancelled/)).not.toBeNull();
+      expect(screen.getByText(/user closed the panel/)).not.toBeNull();
+
+      await act(async () => {
+        resolveSend({ text: 'ok', actions: [] });
+      });
+    });
+  });
+
   describe('tool_progress streaming', () => {
     it('renders streamed CLI lines under the pending tool with the matching callId', async () => {
       let capturedOnEvent: (event: AgentLoopEvent) => void = () => {};

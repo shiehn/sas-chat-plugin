@@ -24,18 +24,27 @@ const COLOR = {
   glyph: '#6AF2C5',
   muted: '#AAB8C7',
   error: '#FF5C7A',
+  /** Subtle accent for clarification questions — distinct from the
+   *  green "user prompt" color so the user notices the model is waiting
+   *  on them, but quieter than the error red. */
+  question: '#FFD074',
 } as const;
 
 export interface TerminalLogProps {
   entries: TerminalEntry[];
   isProcessing: boolean;
   onToggleTurn: (turnId: number) => void;
+  /** Invoked when the user clicks a quick-reply button on a pending
+   *  clarification. The string is the chosen option text. Optional —
+   *  when omitted, buttons render but do nothing (test/SSR contexts). */
+  onQuickReply?: (response: string) => void;
 }
 
 export const TerminalLog: React.FC<TerminalLogProps> = ({
   entries,
   isProcessing,
   onToggleTurn,
+  onQuickReply,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const wasAtBottomRef = useRef(true);
@@ -109,6 +118,7 @@ export const TerminalLog: React.FC<TerminalLogProps> = ({
           entry={entry}
           previous={i > 0 ? visibleEntries[i - 1] : null}
           onToggleTurn={onToggleTurn}
+          onQuickReply={onQuickReply}
           outputLinesByCallId={outputLinesByCallId}
         />
       ))}
@@ -125,6 +135,7 @@ interface EntryRowProps {
   entry: TerminalEntry;
   previous: TerminalEntry | null;
   onToggleTurn: (turnId: number) => void;
+  onQuickReply?: (response: string) => void;
   outputLinesByCallId: Map<
     string,
     Array<Extract<TerminalEntry, { kind: 'tool_output_line' }>>
@@ -135,6 +146,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
   entry,
   previous,
   onToggleTurn,
+  onQuickReply,
   outputLinesByCallId,
 }) => {
   const spacing = needsTopSpacing(entry, previous) ? 8 : 0;
@@ -232,7 +244,88 @@ const EntryRow: React.FC<EntryRowProps> = ({
           {entry.text}
         </div>
       );
+
+    case 'clarification_pending':
+      return (
+        <ClarificationPendingRow
+          entry={entry}
+          spacing={spacing}
+          onQuickReply={onQuickReply}
+        />
+      );
+
+    case 'clarification_resolved':
+      return (
+        <div data-role="clarification-resolved" style={{ marginTop: spacing }}>
+          <div>
+            <span style={{ color: COLOR.question }}>{'  ? '}</span>
+            <span style={{ color: COLOR.user }}>{entry.question}</span>
+          </div>
+          <div>
+            <span style={{ color: COLOR.muted }}>{'  ↳ '}</span>
+            <span style={{ color: COLOR.muted }}>{entry.response}</span>
+          </div>
+        </div>
+      );
   }
+};
+
+interface ClarificationPendingRowProps {
+  entry: Extract<TerminalEntry, { kind: 'clarification_pending' }>;
+  spacing: number;
+  onQuickReply?: (response: string) => void;
+}
+
+const ClarificationPendingRow: React.FC<ClarificationPendingRowProps> = ({
+  entry,
+  spacing,
+  onQuickReply,
+}) => {
+  return (
+    <div
+      data-role="clarification-pending"
+      data-call-id={entry.callId}
+      aria-live="polite"
+      style={{ marginTop: spacing }}
+    >
+      <div>
+        <span style={{ color: COLOR.question }}>{'  ? '}</span>
+        <span style={{ color: COLOR.user }}>{entry.question}</span>
+      </div>
+      {entry.options && entry.options.length > 0 && (
+        <div
+          style={{
+            marginTop: 4,
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: 6,
+            paddingLeft: 24,
+          }}
+        >
+          {entry.options.map((opt) => (
+            <button
+              key={opt}
+              type="button"
+              onClick={() => onQuickReply?.(opt)}
+              style={{
+                background: 'transparent',
+                color: COLOR.question,
+                border: `1px solid ${COLOR.question}55`,
+                borderRadius: 4,
+                padding: '2px 8px',
+                cursor: onQuickReply ? 'pointer' : 'default',
+                fontFamily: FONT,
+                fontSize: 12,
+                opacity: onQuickReply ? 1 : 0.6,
+              }}
+            >
+              {opt}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 };
 
 interface ToolRowProps {
@@ -358,6 +451,8 @@ function needsTopSpacing(entry: TerminalEntry, previous: TerminalEntry | null): 
   if (entry.kind === 'user') return true;
   if (entry.kind === 'assistant') return true;
   if (entry.kind === 'system_error') return true;
+  if (entry.kind === 'clarification_pending') return true;
+  if (entry.kind === 'clarification_resolved') return true;
   // thinking + tool_output_line attach tightly to whatever came before.
   return false;
 }

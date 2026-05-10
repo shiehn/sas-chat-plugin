@@ -40,6 +40,27 @@ export type TerminalEntry =
       result?: unknown;
       error?: string;
     }
+  /** Model is asking the user a clarifying question via the `ask_user`
+   *  synthetic tool. While a clarification is pending the input box stays
+   *  enabled and routes to `sendClarificationResponse` instead of starting
+   *  a new turn. Resolves to `clarification_resolved` when the user replies.
+   */
+  | {
+      kind: 'clarification_pending';
+      id: string;
+      turnId: number;
+      callId: string;
+      question: string;
+      options?: readonly string[];
+    }
+  | {
+      kind: 'clarification_resolved';
+      id: string;
+      turnId: number;
+      callId: string;
+      question: string;
+      response: string;
+    }
   | {
       kind: 'assistant';
       id: string;

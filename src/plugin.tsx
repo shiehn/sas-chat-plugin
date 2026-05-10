@@ -67,6 +67,31 @@ export interface ChatResponse {
   iterationLimitHit: boolean;
 }
 
+/**
+ * Resolves with the user's free-text response to a clarifying question. The
+ * host wires this to whatever transport surfaces the question to the user
+ * (in S&S: an IPC round-trip to the renderer's chat panel).
+ *
+ * Throws/rejects to signal cancellation (scene change, panel closed) — the
+ * agent loop wraps the rejection into a synthetic tool failure so the
+ * model can recover.
+ */
+export type AwaitClarification = (
+  question: string,
+  options?: readonly string[],
+) => Promise<string>;
+
+export interface ChatPanelPluginOptions {
+  /**
+   * Optional clarification transport. When provided, the chat plugin
+   * registers an `ask_user` tool the LLM can call mid-loop; its result is
+   * the user's typed (or button-clicked) response. When omitted, the tool
+   * is NOT registered — the LLM falls back to plain-text questions that
+   * end the turn.
+   */
+  awaitClarification?: AwaitClarification;
+}
+
 const DEFAULT_SYSTEM_PROMPT = `You are an AI assistant embedded in the Signals & Sorcery loop workstation.
 You drive the user's session by calling tools that wrap the \`sas\` CLI — the same surface external agents (Claude Code, Cursor) use at the terminal.
 
@@ -82,7 +107,13 @@ How to work:
 - Read tool errors carefully — the CLI returns structured remediation in stderr.
 - Tools may declare a sceneId parameter — the host injects the active scene automatically; you don't have to pass it.
 - Be concise. The user can hear the result; explanations are for when something needs explaining.
-- If a request is out of scope or unclear, say so plainly and suggest what the user could do instead.`;
+
+When to ask vs proceed:
+- Default to action. For routine intents ("add reverb to the bass", "make drums punchier") pick a sensible default and proceed — the user can hear the result and can undo via \`history undo\`.
+- ONLY call \`ask_user\` when the request is genuinely ambiguous AND a wrong guess would cost real work. Examples: multiple equally-valid candidates ("the bass" with three bass tracks of different roles), missing a load-bearing parameter ("shorten the intro" with no scene specified), an interpretation that would overwrite user intent.
+- When you do ask, keep the question focused (one sentence) and pass an \`options\` array of 2–4 candidates whenever you can enumerate them — the UI renders quick-reply buttons.
+- Do not ask to confirm tool calls you've already decided to make. Do not ask "are you sure?" — destructive operations are reversible.
+- If a request is out of scope, say so plainly and suggest what the user could do instead. Don't use \`ask_user\` for scope rejection.`;
 
 // -----------------------------------------------------------------------------
 // Renderer-side UI — proxies user messages to the main-process plugin via IPC.
@@ -94,6 +125,10 @@ How to work:
 interface ChatPluginRendererBridge {
   sendMessage(message: string): Promise<ChatResponse>;
   onEvent(callback: (event: AgentLoopEvent) => void): () => void;
+  /** Optional — if absent, the chat panel still works for non-clarification
+   *  flows. The chat plugin can run on older preload bundles that predate
+   *  the ask_user wiring without crashing. */
+  sendClarificationResponse?(response: string): Promise<void>;
 }
 
 /**
@@ -145,6 +180,16 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId }) => {
     }
   };
 
+  const sendClarificationResponse = async (response: string): Promise<void> => {
+    const bridge = bridgeRef.current;
+    if (!bridge?.sendClarificationResponse) {
+      throw new Error(
+        'Clarification bridge unavailable — preload may need to be rebuilt.',
+      );
+    }
+    await bridge.sendClarificationResponse(response);
+  };
+
   if (!bridgeAvailable) {
     return React.createElement(
       'div',
@@ -153,7 +198,10 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId }) => {
     );
   }
 
-  return React.createElement(ChatPanel, { sendMessage });
+  return React.createElement(ChatPanel, {
+    sendMessage,
+    sendClarificationResponse,
+  });
 };
 
 // -----------------------------------------------------------------------------
@@ -173,6 +221,11 @@ export class ChatPanelPlugin implements GeneratorPlugin {
   private host: PluginHost | null = null;
   private agent: AgentLoop | null = null;
   private panelTools: PanelTools | null = null;
+  private readonly awaitClarification?: AwaitClarification;
+
+  constructor(options: ChatPanelPluginOptions = {}) {
+    this.awaitClarification = options.awaitClarification;
+  }
 
   /**
    * Activate the plugin. CLI paths are NOT required at activation — they're
@@ -188,7 +241,11 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     const cliPaths = host.getCliPaths();
     if (cliPaths) {
       const { AgentLoop, buildPanelTools } = await loadHostDeps();
-      this.panelTools = await buildPanelTools({ host, cliPaths });
+      this.panelTools = await buildPanelTools({
+        host,
+        cliPaths,
+        awaitUserResponse: this.awaitClarification,
+      });
       this.agent = new AgentLoop({
         host,
         tools: this.panelTools.tools,
@@ -218,7 +275,11 @@ export class ChatPanelPlugin implements GeneratorPlugin {
       );
     }
     const { AgentLoop, buildPanelTools } = await loadHostDeps();
-    this.panelTools = await buildPanelTools({ host: this.host, cliPaths });
+    this.panelTools = await buildPanelTools({
+      host: this.host,
+      cliPaths,
+      awaitUserResponse: this.awaitClarification,
+    });
     this.agent = new AgentLoop({
       host: this.host,
       tools: this.panelTools.tools,
@@ -266,7 +327,11 @@ export class ChatPanelPlugin implements GeneratorPlugin {
       const cliPaths = this.host.getCliPaths();
       if (!cliPaths) return;
       const { AgentLoop, buildPanelTools } = await loadHostDeps();
-      this.panelTools = await buildPanelTools({ host: this.host, cliPaths });
+      this.panelTools = await buildPanelTools({
+        host: this.host,
+        cliPaths,
+        awaitUserResponse: this.awaitClarification,
+      });
       if (this.agent) {
         // Construct a fresh loop with the new tools/executor; previous loop
         // is GC'd once references drop. The system prompt is unchanged.

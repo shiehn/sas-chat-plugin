@@ -6,7 +6,7 @@
  * spawning a subprocess.
  */
 
-import { buildPanelTools } from '../panel-tools';
+import { ASK_USER_TOOL_NAME, buildPanelTools } from '../panel-tools';
 import * as toolHandler from '../sas-tool-handler';
 import type { PluginAppTool } from '@signalsandsorcery/plugin-sdk';
 
@@ -327,6 +327,17 @@ describe('buildPanelTools', () => {
       expect(role.enum).toEqual(['bass', 'drums', 'lead']);
     });
 
+    it('does NOT register ask_user when no awaitUserResponse callback is provided', async () => {
+      const host = makeHost();
+      const result = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+      const names = result.tools[0].functionDeclarations.map((d) => d.name);
+      expect(names).not.toContain(ASK_USER_TOOL_NAME);
+    });
+
     it('recurses into nested object properties and array items', async () => {
       const host = {
         listAppTools: jest.fn().mockResolvedValue([
@@ -369,6 +380,157 @@ describe('buildPanelTools', () => {
       // integer enum coerced inside the array's items
       expect(tracks.items.properties.bars.type).toBe('string');
       expect(tracks.items.properties.bars.enum).toEqual(['2', '4', '8']);
+    });
+  });
+
+  describe('ask_user synthetic tool', () => {
+    it('registers ask_user when awaitUserResponse is provided', async () => {
+      const host = makeHost();
+      const result = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+        awaitUserResponse: jest.fn(),
+      });
+
+      const decls = result.tools[0].functionDeclarations;
+      const askUser = decls.find((d) => d.name === ASK_USER_TOOL_NAME);
+      expect(askUser).toBeDefined();
+      expect(askUser?.parameters.required).toEqual(['question']);
+      // question is required, options is optional
+      const props = askUser?.parameters.properties as Record<string, { type?: string }>;
+      expect(props.question.type).toBe('string');
+      expect(props.options.type).toBe('array');
+    });
+
+    it('routes ask_user calls to awaitUserResponse and returns the reply as stdout', async () => {
+      const host = makeHost();
+      const awaitUserResponse = jest
+        .fn<Promise<string>, [string, string[] | undefined]>()
+        .mockResolvedValue('the bass on track 2');
+
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+        awaitUserResponse,
+      });
+
+      const result = await executor(ASK_USER_TOOL_NAME, {
+        question: 'Which bass?',
+        options: ['track 2', 'track 5'],
+      });
+
+      expect(awaitUserResponse).toHaveBeenCalledWith('Which bass?', [
+        'track 2',
+        'track 5',
+      ]);
+      expect(result).toEqual({
+        success: true,
+        exitCode: 0,
+        stdout: 'the bass on track 2',
+        stderr: '',
+      });
+      // The ask_user path must NOT spawn the CLI subprocess.
+      expect(mockInvokeSas).not.toHaveBeenCalled();
+    });
+
+    it('passes through ask_user without options when none provided', async () => {
+      const host = makeHost();
+      const awaitUserResponse = jest
+        .fn<Promise<string>, [string, string[] | undefined]>()
+        .mockResolvedValue('free-text answer');
+
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+        awaitUserResponse,
+      });
+
+      await executor(ASK_USER_TOOL_NAME, { question: 'What scene?' });
+
+      expect(awaitUserResponse).toHaveBeenCalledWith('What scene?', undefined);
+    });
+
+    it('rejects empty / non-string question with a structured failure (not a throw)', async () => {
+      const host = makeHost();
+      const awaitUserResponse = jest.fn<Promise<string>, [string, string[] | undefined]>();
+
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+        awaitUserResponse,
+      });
+
+      const empty = await executor(ASK_USER_TOOL_NAME, { question: '' });
+      const whitespace = await executor(ASK_USER_TOOL_NAME, { question: '   ' });
+      const missing = await executor(ASK_USER_TOOL_NAME, {});
+
+      expect(empty.success).toBe(false);
+      expect(empty.stderr).toMatch(/non-empty 'question'/);
+      expect(whitespace.success).toBe(false);
+      expect(missing.success).toBe(false);
+      // Should never have been forwarded to the host.
+      expect(awaitUserResponse).not.toHaveBeenCalled();
+    });
+
+    it('feeds awaitUserResponse rejections back as synthetic failures', async () => {
+      const host = makeHost();
+      const awaitUserResponse = jest
+        .fn<Promise<string>, [string, string[] | undefined]>()
+        .mockRejectedValue(new Error('user closed the panel'));
+
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+        awaitUserResponse,
+      });
+
+      const result = await executor(ASK_USER_TOOL_NAME, { question: 'go?' });
+      expect(result.success).toBe(false);
+      expect(result.stderr).toContain('user closed the panel');
+    });
+
+    it("returns a friendly failure when the model calls ask_user but no callback is wired", async () => {
+      // Defensive: this path can only fire if the LLM hallucinates the
+      // tool (we don't register it without a callback). Verify we
+      // recover instead of hanging.
+      const host = makeHost();
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const result = await executor(ASK_USER_TOOL_NAME, { question: 'x' });
+      expect(result.success).toBe(false);
+      expect(result.stderr).toMatch(/not available/);
+    });
+
+    it('filters non-string entries out of the options array before forwarding', async () => {
+      const host = makeHost();
+      const awaitUserResponse = jest
+        .fn<Promise<string>, [string, string[] | undefined]>()
+        .mockResolvedValue('ok');
+
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+        awaitUserResponse,
+      });
+
+      // Mixed-type options array — typical when the LLM half-coerces.
+      await executor(ASK_USER_TOOL_NAME, {
+        question: 'go?',
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        options: ['a', 1, null, 'b'] as any,
+      });
+
+      expect(awaitUserResponse).toHaveBeenCalledWith('go?', ['a', 'b']);
     });
   });
 });

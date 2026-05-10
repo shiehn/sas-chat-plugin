@@ -31,8 +31,25 @@ export interface ChatPanelProps {
     message: string,
     onEvent: (event: AgentLoopEvent) => void
   ) => Promise<ChatPanelResponse>;
+  /**
+   * Routes the user's reply to a pending `ask_user` clarification back to
+   * the main-process agent loop. When omitted, the synthetic `ask_user`
+   * tool is treated as a normal tool row (no input routing) — useful in
+   * tests and out-of-Electron contexts.
+   */
+  sendClarificationResponse?: (response: string) => Promise<void>;
   initialEntries?: TerminalEntry[];
   registerReset?: (reset: () => void) => void;
+}
+
+/** Synthetic tool name the agent loop emits when the model calls ask_user. */
+const ASK_USER_TOOL_NAME = 'ask_user';
+
+interface PendingClarification {
+  callId: string;
+  turnId: number;
+  question: string;
+  options?: readonly string[];
 }
 
 let idCounter = 0;
@@ -62,12 +79,20 @@ function ensureBlinkStyle(): void {
 
 export const ChatPanel: React.FC<ChatPanelProps> = ({
   sendMessage,
+  sendClarificationResponse,
   initialEntries = [],
   registerReset,
 }) => {
   const [entries, setEntries] = useState<TerminalEntry[]>(initialEntries);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [pendingClarification, setPendingClarification] =
+    useState<PendingClarification | null>(null);
+  const pendingClarificationRef = useRef<PendingClarification | null>(null);
   const turnCounterRef = useRef(0);
+
+  useEffect(() => {
+    pendingClarificationRef.current = pendingClarification;
+  }, [pendingClarification]);
 
   useEffect(() => {
     ensureBlinkStyle();
@@ -78,6 +103,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     registerReset(() => {
       setEntries([]);
       setIsProcessing(false);
+      setPendingClarification(null);
     });
   }, [registerReset]);
 
@@ -91,8 +117,65 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     );
   }, []);
 
+  const submitClarification = useCallback(
+    async (response: string, pending: PendingClarification): Promise<void> => {
+      // Optimistically render the user's reply as a "user" row so the
+      // visual sequence matches a normal turn, then clear the pending slot
+      // immediately so the input box re-disables until the loop resumes
+      // and the next event arrives.
+      setEntries((prev) => [
+        ...prev,
+        {
+          kind: 'user',
+          id: nextId(),
+          turnId: pending.turnId,
+          text: response,
+        },
+      ]);
+      setPendingClarification(null);
+      if (!sendClarificationResponse) {
+        // Defensive: caller didn't wire the bridge. Surface a clear error
+        // rather than silently dropping the response.
+        setEntries((prev) => [
+          ...prev,
+          {
+            kind: 'system_error',
+            id: nextId(),
+            turnId: pending.turnId,
+            text:
+              'Clarification bridge unavailable — restart the app or reopen the chat panel.',
+          },
+        ]);
+        return;
+      }
+      try {
+        await sendClarificationResponse(response);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setEntries((prev) => [
+          ...prev,
+          {
+            kind: 'system_error',
+            id: nextId(),
+            turnId: pending.turnId,
+            text: msg,
+          },
+        ]);
+      }
+    },
+    [sendClarificationResponse]
+  );
+
   const handleSend = useCallback(
     async (text: string): Promise<void> => {
+      // Pending clarification takes priority — route the message back into
+      // the in-flight loop instead of starting a new turn.
+      const pending = pendingClarificationRef.current;
+      if (pending) {
+        await submitClarification(text, pending);
+        return;
+      }
+
       turnCounterRef.current += 1;
       const turnId = turnCounterRef.current;
       const userEntry: TerminalEntry = {
@@ -106,6 +189,38 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
       const onEvent = (event: AgentLoopEvent): void => {
         setEntries((prev) => applyEvent(prev, event, turnId));
+        // Track the pending-clarification side-effect outside the entries
+        // reducer so React's strict-mode double-invoke can't double-fire it.
+        if (
+          event.type === 'tool_call_start' &&
+          event.toolName === ASK_USER_TOOL_NAME
+        ) {
+          const question =
+            typeof event.toolArgs.question === 'string'
+              ? event.toolArgs.question
+              : '';
+          const optionsRaw = event.toolArgs.options;
+          const options = Array.isArray(optionsRaw)
+            ? optionsRaw.filter((o): o is string => typeof o === 'string')
+            : undefined;
+          setPendingClarification({
+            callId: event.callId,
+            turnId,
+            question,
+            options: options && options.length > 0 ? options : undefined,
+          });
+        } else if (
+          event.type === 'tool_call_done' &&
+          event.toolName === ASK_USER_TOOL_NAME
+        ) {
+          // Loop has resumed — clear any lingering pending state. The
+          // optimistic clear in submitClarification usually handles this,
+          // but a cancellation path (executor rejected) could land here
+          // without a user reply.
+          setPendingClarification((prev) =>
+            prev && prev.callId === event.callId ? null : prev,
+          );
+        }
       };
 
       try {
@@ -124,10 +239,28 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         setEntries((prev) => [...prev, errorEntry]);
       } finally {
         setIsProcessing(false);
+        // Belt-and-suspenders: if the loop unwound while a clarification
+        // was still showing, drop it so the input box returns to its
+        // normal mode.
+        setPendingClarification(null);
       }
     },
-    [sendMessage]
+    [sendMessage, submitClarification]
   );
+
+  const handleQuickReply = useCallback(
+    (response: string): void => {
+      const pending = pendingClarificationRef.current;
+      if (!pending) return;
+      void submitClarification(response, pending);
+    },
+    [submitClarification]
+  );
+
+  // Input box is disabled during processing UNLESS we're waiting on the
+  // user's clarification — that's the one moment mid-turn the user is
+  // expected to type.
+  const inputDisabled = isProcessing && pendingClarification === null;
 
   return (
     <div
@@ -144,8 +277,17 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         entries={entries}
         isProcessing={isProcessing}
         onToggleTurn={handleToggleTurn}
+        onQuickReply={handleQuickReply}
       />
-      <InputBox onSend={handleSend} disabled={isProcessing} />
+      <InputBox
+        onSend={handleSend}
+        disabled={inputDisabled}
+        placeholder={
+          pendingClarification
+            ? 'answer the question above — Enter to send'
+            : undefined
+        }
+      />
     </div>
   );
 };
@@ -177,11 +319,35 @@ function applyEvent(
     case 'llm_call_end':
       return removeThinking(entries, turnId);
 
-    case 'tool_call_start':
+    case 'tool_call_start': {
       // Defensive: if llm_call_end was lost mid-flight, the thinking row
       // would otherwise hang around once a tool starts. Strip it now.
+      const cleaned = removeThinking(entries, turnId);
+      if (event.toolName === ASK_USER_TOOL_NAME) {
+        // Synthetic clarification path — render a styled question entry
+        // instead of a generic tool row. The args carry { question, options? }.
+        const question =
+          typeof event.toolArgs.question === 'string'
+            ? event.toolArgs.question
+            : '';
+        const optionsRaw = event.toolArgs.options;
+        const options = Array.isArray(optionsRaw)
+          ? optionsRaw.filter((o): o is string => typeof o === 'string')
+          : undefined;
+        return [
+          ...cleaned,
+          {
+            kind: 'clarification_pending',
+            id: nextId(),
+            turnId,
+            callId: event.callId,
+            question,
+            options: options && options.length > 0 ? options : undefined,
+          },
+        ];
+      }
       return [
-        ...removeThinking(entries, turnId),
+        ...cleaned,
         {
           kind: 'tool_pending',
           id: nextId(),
@@ -191,6 +357,7 @@ function applyEvent(
           params: event.toolArgs,
         },
       ];
+    }
 
     case 'tool_progress':
       return [
@@ -218,6 +385,44 @@ function applyEvent(
           : event.result.stdout.length > 0
             ? event.result.stdout
             : `Tool exited with code ${event.result.exitCode}`;
+      if (event.toolName === ASK_USER_TOOL_NAME) {
+        // Convert the styled pending entry into a resolved one. On success,
+        // stdout carries the user's response. On failure (cancellation or
+        // missing transport) emit a system_error so the user sees what
+        // happened.
+        if (isFailure) {
+          return [
+            ...entries.filter(
+              (e) =>
+                !(
+                  e.kind === 'clarification_pending' &&
+                  e.turnId === turnId &&
+                  e.callId === event.callId
+                ),
+            ),
+            {
+              kind: 'system_error',
+              id: nextId(),
+              turnId,
+              text: `Clarification cancelled: ${errorText}`,
+            },
+          ];
+        }
+        return entries.map((e) =>
+          e.kind === 'clarification_pending' &&
+          e.turnId === turnId &&
+          e.callId === event.callId
+            ? {
+                kind: 'clarification_resolved',
+                id: e.id,
+                turnId,
+                callId: event.callId,
+                question: e.question,
+                response: event.result.stdout,
+              }
+            : e,
+        );
+      }
       return entries.map((e) =>
         e.kind === 'tool_pending' &&
         e.turnId === turnId &&

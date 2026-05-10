@@ -710,6 +710,97 @@ describe('AgentLoop', () => {
     expect(streams).toEqual(['stdout', 'stderr', 'stdout']);
   });
 
+  it('completes a full ask_user round-trip without restarting the turn', async () => {
+    /** Simulates the model calling `ask_user`, the executor returning the
+     *  user's response as stdout, and the model continuing to a final text.
+     *  This is the load-bearing test for the clarification feature: it
+     *  proves the loop treats ask_user like any other tool — single turn,
+     *  single user message, history threaded correctly. */
+    const host = makeScriptedHost([
+      // Iter 1: model calls ask_user.
+      toolCallResponse('ask_user', {
+        question: 'Which bass: track 2 or track 5?',
+        options: ['track 2', 'track 5'],
+      }),
+      // Iter 2: model emits final text with the user's choice baked in.
+      textResponse('Boosted track 2 with reverb.'),
+    ]);
+
+    // Executor pretends to be the chat plugin's ask_user routing — the
+    // user replied "track 2".
+    const executor: ToolExecutor = jest.fn().mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      stdout: 'track 2',
+      stderr: '',
+    });
+    const events: AgentLoopEvent[] = [];
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      onEvent: (e) => events.push(e),
+    });
+
+    const result = await loop.run('boost the bass with reverb');
+
+    expect(result.text).toBe('Boosted track 2 with reverb.');
+    expect(result.iterations).toBe(2);
+    expect(executor).toHaveBeenCalledWith(
+      'ask_user',
+      { question: 'Which bass: track 2 or track 5?', options: ['track 2', 'track 5'] },
+      expect.any(Function),
+    );
+
+    // The user's response must be threaded back in as a functionResponse so
+    // the model has the answer when generating the final text.
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: Array<{
+        role: string;
+        parts: Array<{ functionResponse?: { name: string; response: { stdout: string } } }>;
+      }>;
+    };
+    const lastPart = secondCall.contents[secondCall.contents.length - 1].parts[0];
+    expect(lastPart.functionResponse?.name).toBe('ask_user');
+    expect(lastPart.functionResponse?.response.stdout).toBe('track 2');
+  });
+
+  it('feeds an executor rejection on ask_user back as a synthetic failure (loop continues)', async () => {
+    /** Mirrors the cancellation path: the user closed the panel mid-question.
+     *  The executor rejects, the loop wraps the rejection into a synthetic
+     *  failure, and the model recovers in the next turn. */
+    const host = makeScriptedHost([
+      toolCallResponse('ask_user', { question: 'which one?' }),
+      textResponse('Cancelled — let me know when you decide.'),
+    ]);
+    const executor: ToolExecutor = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('Clarification cancelled'));
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+
+    const result = await loop.run('do the thing');
+
+    expect(result.text).toBe('Cancelled — let me know when you decide.');
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: Array<{
+        parts: Array<{ functionResponse?: { response: { success: boolean; stderr: string } } }>;
+      }>;
+    };
+    const fr = secondCall.contents[secondCall.contents.length - 1].parts[0].functionResponse;
+    expect(fr?.response.success).toBe(false);
+    expect(fr?.response.stderr).toContain('Clarification cancelled');
+  });
+
   it('refuses concurrent run() calls', async () => {
     /** Defensive: if someone fires two run()s in parallel (UI guard bypassed),
      *  surface the violation instead of corrupting `this.contents`. */

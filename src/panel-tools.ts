@@ -31,10 +31,34 @@ export interface PanelTools {
   executor: ToolExecutor;
 }
 
+/**
+ * Suspends until the user types (or button-clicks) a response to the model's
+ * clarifying question. The host wires this to whatever transport surfaces
+ * the question (in S&S: an IPC round-trip to the renderer's chat panel).
+ *
+ * Throwing/rejecting is a valid signal — the executor wraps it into a
+ * synthetic tool failure so the loop stays alive.
+ */
+export type AwaitUserResponse = (
+  question: string,
+  options?: readonly string[],
+) => Promise<string>;
+
+/** Synthetic tool name for the model-driven clarification path. */
+export const ASK_USER_TOOL_NAME = 'ask_user';
+
 export interface BuildPanelToolsOptions {
   host: PluginHost;
   /** Paths for spawning the `sas` CLI. From `host.getCliPaths()` typically. */
   cliPaths: { appExe: string; cliEntry: string };
+  /**
+   * When provided, registers the synthetic `ask_user` tool the LLM can
+   * call mid-loop to surface a focused clarifying question to the user.
+   * The returned string is fed back as the tool's stdout, so the loop
+   * continues without restarting a turn. Omit to disable the tool
+   * entirely (the LLM falls back to plain-text responses).
+   */
+  awaitUserResponse?: AwaitUserResponse;
 }
 
 /**
@@ -49,9 +73,14 @@ export interface BuildPanelToolsOptions {
 export async function buildPanelTools(
   options: BuildPanelToolsOptions
 ): Promise<PanelTools> {
-  const { host, cliPaths } = options;
+  const { host, cliPaths, awaitUserResponse } = options;
   const appTools = await host.listAppTools({ scope: 'scene' });
-  const declarations = appTools.map(toFunctionDeclaration);
+  const declarations: LLMFunctionDeclaration[] = appTools.map(
+    toFunctionDeclaration,
+  );
+  if (awaitUserResponse) {
+    declarations.push(buildAskUserDeclaration());
+  }
   const tools: LLMTool[] =
     declarations.length > 0 ? [{ functionDeclarations: declarations }] : [];
 
@@ -61,6 +90,49 @@ export async function buildPanelTools(
   const activeSceneId = host.getActiveSceneId();
 
   const executor: ToolExecutor = async (name, args, onProgress) => {
+    if (name === ASK_USER_TOOL_NAME) {
+      // Synthetic tool — bypass the CLI subprocess entirely. The host
+      // callback is what surfaces the question to the user and waits for
+      // their response. Falsy/missing callback means the LLM hallucinated
+      // the tool (we didn't register it) — return a structured failure
+      // so it can recover instead of hanging.
+      if (!awaitUserResponse) {
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr:
+            "Tool 'ask_user' is not available in this session — answer the user yourself or pick a sensible default.",
+        };
+      }
+      const question =
+        typeof args.question === 'string' ? args.question.trim() : '';
+      if (question.length === 0) {
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr:
+            "ask_user requires a non-empty 'question' argument (string).",
+        };
+      }
+      const optionsArg = Array.isArray(args.options)
+        ? args.options.filter((o): o is string => typeof o === 'string')
+        : undefined;
+      try {
+        const response = await awaitUserResponse(question, optionsArg);
+        return {
+          success: true,
+          exitCode: 0,
+          stdout: response,
+          stderr: '',
+        };
+      } catch (err) {
+        const stderr = err instanceof Error ? err.message : String(err);
+        return { success: false, exitCode: 1, stdout: '', stderr };
+      }
+    }
+
     const def = toolByName.get(name);
     if (!def) {
       // Unknown tool — feed back a structured failure so the model can
@@ -85,6 +157,37 @@ export async function buildPanelTools(
   };
 
   return { tools, executor };
+}
+
+/**
+ * Synthetic declaration for the `ask_user` tool. Schema mirrors what the
+ * UI consumes: a `question` string and an optional `options` array of
+ * 2–4 candidate quick-reply strings. No `sceneId` — clarification is
+ * scene-agnostic.
+ */
+function buildAskUserDeclaration(): LLMFunctionDeclaration {
+  return {
+    name: ASK_USER_TOOL_NAME,
+    description:
+      'Ask the user a focused clarifying question and wait for their typed response. Use ONLY when the request is genuinely ambiguous AND a wrong guess would cost real work (multiple equally-valid candidates, missing load-bearing parameter). Do NOT use to confirm decisions you have already made or to ask "are you sure?" — operations are reversible. Returns the user\'s response as plain text in stdout.',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description:
+            'The clarifying question. One sentence. Specific. Mention the candidate values where relevant.',
+        },
+        options: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional 2–4 candidate quick-reply strings. When provided, the UI renders them as clickable buttons and the user can type a free-text answer instead. Omit when the answer space is open-ended.',
+        },
+      },
+      required: ['question'],
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

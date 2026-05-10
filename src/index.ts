@@ -15,7 +15,12 @@
  */
 
 export { ChatPanelPlugin, CHAT_PANEL_PLUGIN_ID } from './plugin';
-export type { ChatInvocation, ChatResponse } from './plugin';
+export type {
+  ChatInvocation,
+  ChatResponse,
+  ChatPanelPluginOptions,
+  AwaitClarification,
+} from './plugin';
 
 // Type-only re-exports — renderer-safe (TypeScript erases at build time).
 // The runtime values live at '@signalsandsorcery/chat-plugin/host' so they
@@ -29,7 +34,12 @@ export type {
   ToolExecutionResult,
 } from './agent-loop';
 export type { SasToolInvocation, SasToolResult } from './sas-tool-handler';
-export type { PanelTools } from './panel-tools';
+export type {
+  PanelTools,
+  AwaitUserResponse,
+  BuildPanelToolsOptions,
+} from './panel-tools';
+export { ASK_USER_TOOL_NAME } from './panel-tools';
 
 export { default } from './plugin';
 
