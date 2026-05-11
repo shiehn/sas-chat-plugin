@@ -38,6 +38,10 @@ export interface TerminalLogProps {
    *  clarification. The string is the chosen option text. Optional —
    *  when omitted, buttons render but do nothing (test/SSR contexts). */
   onQuickReply?: (response: string) => void;
+  /** Invoked when the user clicks a next-step button on a `next_steps`
+   *  row. The string is the chosen step's `description` — ChatPanel
+   *  submits it as a new user message. Optional. */
+  onNextStep?: (description: string) => void;
 }
 
 export const TerminalLog: React.FC<TerminalLogProps> = ({
@@ -45,6 +49,7 @@ export const TerminalLog: React.FC<TerminalLogProps> = ({
   isProcessing,
   onToggleTurn,
   onQuickReply,
+  onNextStep,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const wasAtBottomRef = useRef(true);
@@ -119,6 +124,7 @@ export const TerminalLog: React.FC<TerminalLogProps> = ({
           previous={i > 0 ? visibleEntries[i - 1] : null}
           onToggleTurn={onToggleTurn}
           onQuickReply={onQuickReply}
+          onNextStep={onNextStep}
           outputLinesByCallId={outputLinesByCallId}
         />
       ))}
@@ -136,6 +142,7 @@ interface EntryRowProps {
   previous: TerminalEntry | null;
   onToggleTurn: (turnId: number) => void;
   onQuickReply?: (response: string) => void;
+  onNextStep?: (description: string) => void;
   outputLinesByCallId: Map<
     string,
     Array<Extract<TerminalEntry, { kind: 'tool_output_line' }>>
@@ -147,6 +154,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
   previous,
   onToggleTurn,
   onQuickReply,
+  onNextStep,
   outputLinesByCallId,
 }) => {
   const spacing = needsTopSpacing(entry, previous) ? 8 : 0;
@@ -267,7 +275,68 @@ const EntryRow: React.FC<EntryRowProps> = ({
           </div>
         </div>
       );
+
+    case 'next_steps':
+      return (
+        <NextStepsRow entry={entry} spacing={spacing} onNextStep={onNextStep} />
+      );
   }
+};
+
+interface NextStepsRowProps {
+  entry: Extract<TerminalEntry, { kind: 'next_steps' }>;
+  spacing: number;
+  onNextStep?: (description: string) => void;
+}
+
+const NextStepsRow: React.FC<NextStepsRowProps> = ({
+  entry,
+  spacing,
+  onNextStep,
+}) => {
+  if (entry.steps.length === 0) return null;
+  return (
+    <div
+      data-role="next-steps"
+      data-call-id={entry.callId}
+      style={{ marginTop: spacing, paddingLeft: 24 }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: 6,
+        }}
+      >
+        {entry.steps.map((step, i) => {
+          // Secondary steps render dimmer, matching the CLI's `priority`
+          // rendering hint (see tool-result.ts NextStep.priority).
+          const isPrimary = (step.priority ?? 'primary') === 'primary';
+          return (
+            <button
+              key={`${step.description}-${i}`}
+              type="button"
+              data-priority={isPrimary ? 'primary' : 'secondary'}
+              onClick={() => onNextStep?.(step.description)}
+              style={{
+                background: 'transparent',
+                color: COLOR.prompt,
+                border: `1px solid ${COLOR.prompt}${isPrimary ? '88' : '44'}`,
+                borderRadius: 4,
+                padding: '2px 8px',
+                cursor: onNextStep ? 'pointer' : 'default',
+                fontFamily: FONT,
+                fontSize: 12,
+                opacity: onNextStep ? (isPrimary ? 1 : 0.65) : 0.4,
+              }}
+            >
+              {step.description}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 };
 
 interface ClarificationPendingRowProps {
@@ -453,6 +522,7 @@ function needsTopSpacing(entry: TerminalEntry, previous: TerminalEntry | null): 
   if (entry.kind === 'system_error') return true;
   if (entry.kind === 'clarification_pending') return true;
   if (entry.kind === 'clarification_resolved') return true;
+  if (entry.kind === 'next_steps') return true;
   // thinking + tool_output_line attach tightly to whatever came before.
   return false;
 }

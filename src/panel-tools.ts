@@ -22,7 +22,10 @@ import type {
   LLMFunctionDeclaration,
 } from '@signalsandsorcery/plugin-sdk';
 import { invokeSas } from './sas-tool-handler';
-import type { ToolExecutor } from './agent-loop';
+import type { AgentNextStep, ToolExecutor } from './agent-loop';
+import { ASK_USER_TOOL_NAME } from './constants';
+
+export { ASK_USER_TOOL_NAME };
 
 export interface PanelTools {
   /** LLM-facing tool declarations (single `LLMTool` wrapping all functions). */
@@ -44,8 +47,6 @@ export type AwaitUserResponse = (
   options?: readonly string[],
 ) => Promise<string>;
 
-/** Synthetic tool name for the model-driven clarification path. */
-export const ASK_USER_TOOL_NAME = 'ask_user';
 
 export interface BuildPanelToolsOptions {
   host: PluginHost;
@@ -147,16 +148,63 @@ export async function buildPanelTools(
     }
 
     const params = injectActiveSceneId(args, def, activeSceneId);
-    return invokeSas({
+    const sasResult = await invokeSas({
       action: name,
       params,
       appExe: cliPaths.appExe,
       cliEntry: cliPaths.cliEntry,
       onProgress,
     });
+    return {
+      success: sasResult.success,
+      exitCode: sasResult.exitCode,
+      stdout: sasResult.stdout,
+      stderr: sasResult.stderr,
+      // Pull nextSteps off the CLI's parsed OperationResult so the agent loop
+      // can emit a `next_steps` event. The CLI does the substitution work
+      // (IDs filled in, mcp form populated) — we just narrow the shape.
+      nextSteps: extractNextSteps(sasResult.parsedStdout),
+    };
   };
 
   return { tools, executor };
+}
+
+/**
+ * Narrow `OperationResult.nextSteps[]` from the CLI's parsed stdout. Returns
+ * `undefined` when the parsed value isn't a success envelope with a
+ * well-formed array — the agent loop treats `undefined` and `[]` the same
+ * (no `next_steps` event emitted), so we don't need to distinguish them.
+ *
+ * Exported for unit testing.
+ */
+export function extractNextSteps(parsed: unknown): AgentNextStep[] | undefined {
+  if (!isRecord(parsed)) return undefined;
+  if (parsed.success !== true) return undefined;
+  const raw = parsed.nextSteps;
+  if (!Array.isArray(raw)) return undefined;
+  const out: AgentNextStep[] = [];
+  for (const item of raw) {
+    if (!isRecord(item)) continue;
+    if (typeof item.description !== 'string') continue;
+    const step: AgentNextStep = { description: item.description };
+    if (typeof item.cli === 'string') step.cli = item.cli;
+    if (isMcpShape(item.mcp)) step.mcp = item.mcp;
+    if (item.priority === 'primary' || item.priority === 'secondary') {
+      step.priority = item.priority;
+    }
+    out.push(step);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function isMcpShape(
+  v: unknown,
+): v is { tool: string; args: Record<string, unknown> } {
+  if (!isRecord(v)) return false;
+  if (typeof v.tool !== 'string') return false;
+  if (!isRecord(v.args)) return false;
+  return true;
 }
 
 /**

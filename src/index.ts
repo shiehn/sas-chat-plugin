@@ -39,7 +39,12 @@ export type {
   AwaitUserResponse,
   BuildPanelToolsOptions,
 } from './panel-tools';
-export { ASK_USER_TOOL_NAME } from './panel-tools';
+// Sourced from a dedicated dependency-free module, NOT from `./panel-tools`.
+// `./panel-tools` transitively imports `node:child_process` via
+// `./sas-tool-handler`, and a value-level re-export from there would pull
+// the host-only graph into the renderer's static bundle (and crash with
+// `ReferenceError: require is not defined` on app launch).
+export { ASK_USER_TOOL_NAME } from './constants';
 
 export { default } from './plugin';
 

@@ -6,7 +6,7 @@
  * spawning a subprocess.
  */
 
-import { ASK_USER_TOOL_NAME, buildPanelTools } from '../panel-tools';
+import { ASK_USER_TOOL_NAME, buildPanelTools, extractNextSteps } from '../panel-tools';
 import * as toolHandler from '../sas-tool-handler';
 import type { PluginAppTool } from '@signalsandsorcery/plugin-sdk';
 
@@ -197,6 +197,77 @@ describe('buildPanelTools', () => {
     expect(result.stderr).toContain("Unknown tool 'not_a_real_tool'");
     expect(result.stderr).toContain('scene_get_tracks');
     expect(mockInvokeSas).not.toHaveBeenCalled();
+  });
+
+  it('executor surfaces nextSteps from the CLI parsed OperationResult', async () => {
+    const host = makeHost();
+    mockInvokeSas.mockResolvedValueOnce({
+      success: true,
+      exitCode: 0,
+      stdout: JSON.stringify({
+        success: true,
+        action: 'transport_play',
+        nextSteps: [
+          {
+            description: 'Stop playback',
+            cli: 'sas transport_stop',
+            mcp: { tool: 'transport_stop', args: {} },
+            priority: 'primary',
+          },
+        ],
+      }),
+      stderr: '',
+      parsedStdout: {
+        success: true,
+        action: 'transport_play',
+        nextSteps: [
+          {
+            description: 'Stop playback',
+            cli: 'sas transport_stop',
+            mcp: { tool: 'transport_stop', args: {} },
+            priority: 'primary',
+          },
+        ],
+      },
+    });
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+
+    const result = await executor('transport_play', {});
+
+    expect(result.success).toBe(true);
+    expect(result.nextSteps).toHaveLength(1);
+    expect(result.nextSteps?.[0]).toEqual({
+      description: 'Stop playback',
+      cli: 'sas transport_stop',
+      mcp: { tool: 'transport_stop', args: {} },
+      priority: 'primary',
+    });
+  });
+
+  it('executor returns no nextSteps when the CLI output has none', async () => {
+    const host = makeHost();
+    // Default mock returns stdout: '{}' with no parsedStdout — but be explicit.
+    mockInvokeSas.mockResolvedValueOnce({
+      success: true,
+      exitCode: 0,
+      stdout: '{"success":true,"action":"transport_play"}',
+      stderr: '',
+      parsedStdout: { success: true, action: 'transport_play' },
+    });
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+
+    const result = await executor('transport_play', {});
+
+    expect(result.success).toBe(true);
+    expect(result.nextSteps).toBeUndefined();
   });
 
   it('skips sceneId injection when no scene is active', async () => {
@@ -532,5 +603,79 @@ describe('buildPanelTools', () => {
 
       expect(awaitUserResponse).toHaveBeenCalledWith('go?', ['a', 'b']);
     });
+  });
+});
+
+describe('extractNextSteps', () => {
+  it('returns the array when parsed is a success envelope with well-formed steps', () => {
+    const steps = extractNextSteps({
+      success: true,
+      action: 'compose_scene',
+      nextSteps: [
+        { description: 'a', cli: 'sas a', priority: 'primary' },
+        { description: 'b', mcp: { tool: 'b', args: { x: 1 } } },
+      ],
+    });
+    expect(steps).toEqual([
+      { description: 'a', cli: 'sas a', priority: 'primary' },
+      { description: 'b', mcp: { tool: 'b', args: { x: 1 } } },
+    ]);
+  });
+
+  it('returns undefined when success !== true', () => {
+    expect(
+      extractNextSteps({
+        success: false,
+        nextSteps: [{ description: 'x' }],
+      }),
+    ).toBeUndefined();
+  });
+
+  it('returns undefined for non-objects, missing nextSteps, or empty arrays', () => {
+    expect(extractNextSteps(undefined)).toBeUndefined();
+    expect(extractNextSteps(null)).toBeUndefined();
+    expect(extractNextSteps('string')).toBeUndefined();
+    expect(extractNextSteps({ success: true })).toBeUndefined();
+    expect(extractNextSteps({ success: true, nextSteps: [] })).toBeUndefined();
+  });
+
+  it('drops malformed items (missing description) but keeps the well-formed siblings', () => {
+    const steps = extractNextSteps({
+      success: true,
+      nextSteps: [
+        { description: 'good' },
+        { cli: 'no description' }, // dropped
+        { description: 42 }, // dropped (wrong type)
+        { description: 'also good', priority: 'secondary' },
+      ],
+    });
+    expect(steps).toEqual([
+      { description: 'good' },
+      { description: 'also good', priority: 'secondary' },
+    ]);
+  });
+
+  it('ignores unknown priority values', () => {
+    const steps = extractNextSteps({
+      success: true,
+      nextSteps: [{ description: 'x', priority: 'tertiary' }],
+    });
+    expect(steps).toEqual([{ description: 'x' }]);
+  });
+
+  it('drops malformed mcp shapes', () => {
+    const steps = extractNextSteps({
+      success: true,
+      nextSteps: [
+        { description: 'a', mcp: { tool: 'a' } }, // missing args
+        { description: 'b', mcp: 'not-an-object' },
+        { description: 'c', mcp: { tool: 'c', args: { ok: true } } },
+      ],
+    });
+    expect(steps).toEqual([
+      { description: 'a' },
+      { description: 'b' },
+      { description: 'c', mcp: { tool: 'c', args: { ok: true } } },
+    ]);
   });
 });

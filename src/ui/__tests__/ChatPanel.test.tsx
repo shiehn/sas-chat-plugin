@@ -879,4 +879,142 @@ describe('ChatPanel (terminal log)', () => {
       expect(screen.getByText(/midline log/)).not.toBeNull();
     });
   });
+
+  describe('next_steps row', () => {
+    it('renders a button row when next_steps fires after a successful tool call', async () => {
+      sendFn.mockImplementation(async (_msg, onEvent) => {
+        onEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'dsl_shuffle_preset',
+          toolArgs: { track: 'Snare' },
+        });
+        onEvent(
+          toolDoneSuccess(1, 'c1', 'dsl_shuffle_preset', { track: 'Snare' }, '{}'),
+        );
+        onEvent({
+          type: 'next_steps',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'dsl_shuffle_preset',
+          steps: [
+            {
+              description: 'Try a different snare preset',
+              cli: 'sas dsl_shuffle_preset --track Snare',
+              priority: 'primary',
+            },
+            {
+              description: 'Add an FX rack',
+              cli: 'sas dsl_set_track_fx --track Snare',
+              priority: 'secondary',
+            },
+          ],
+        });
+        onEvent({
+          type: 'final_text',
+          iterations: 1,
+          text: 'Picked a fresh snare preset.',
+        });
+        return { text: 'Picked a fresh snare preset.', actions: [] };
+      });
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('shuffle the snare');
+      });
+
+      // Both buttons present
+      expect(screen.getByRole('button', { name: 'Try a different snare preset' })).not.toBeNull();
+      expect(screen.getByRole('button', { name: 'Add an FX rack' })).not.toBeNull();
+
+      // Primary/secondary priority threads through to a data-attribute so
+      // a visual regression can be asserted without sniffing inline styles.
+      const primary = screen.getByRole('button', { name: 'Try a different snare preset' });
+      const secondary = screen.getByRole('button', { name: 'Add an FX rack' });
+      expect(primary.getAttribute('data-priority')).toBe('primary');
+      expect(secondary.getAttribute('data-priority')).toBe('secondary');
+    });
+
+    it('clicking a next-step button submits its description as a new user message', async () => {
+      let firstResolve: () => void = () => {};
+      let secondMessage: string | null = null;
+
+      sendFn.mockImplementation(async (msg, onEvent) => {
+        if (msg === 'shuffle the snare') {
+          // Turn 1 — emit next_steps, then resolve.
+          onEvent({
+            type: 'tool_call_start',
+            iteration: 1,
+            callId: 'c1',
+            toolName: 'dsl_shuffle_preset',
+            toolArgs: { track: 'Snare' },
+          });
+          onEvent(toolDoneSuccess(1, 'c1', 'dsl_shuffle_preset', { track: 'Snare' }, '{}'));
+          onEvent({
+            type: 'next_steps',
+            iteration: 1,
+            callId: 'c1',
+            toolName: 'dsl_shuffle_preset',
+            steps: [
+              { description: 'Try a different snare preset', priority: 'primary' },
+            ],
+          });
+          onEvent({ type: 'final_text', iterations: 1, text: 'Done.' });
+          return { text: 'Done.', actions: [] };
+        }
+        // Turn 2 — record the message and resolve.
+        secondMessage = msg;
+        onEvent({ type: 'final_text', iterations: 1, text: 'Picked another.' });
+        return new Promise((resolve) => {
+          firstResolve = () => resolve({ text: 'Picked another.', actions: [] });
+        });
+      });
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('shuffle the snare');
+      });
+
+      const btn = await screen.findByRole('button', {
+        name: 'Try a different snare preset',
+      });
+      await act(async () => {
+        fireEvent.click(btn);
+      });
+
+      await waitFor(() => {
+        expect(secondMessage).toBe('Try a different snare preset');
+      });
+
+      await act(async () => {
+        firstResolve();
+      });
+    });
+
+    it('does NOT render next_steps when the tool call was a failure (loop never emits)', async () => {
+      // Defensive: the agent loop guards this, but assert ChatPanel doesn't
+      // render anything when no next_steps event arrives.
+      sendFn.mockImplementation(async (_msg, onEvent) => {
+        onEvent({
+          type: 'tool_call_start',
+          iteration: 1,
+          callId: 'c1',
+          toolName: 'bad',
+          toolArgs: {},
+        });
+        onEvent(toolDoneFailure(1, 'c1', 'bad', {}, 'oops'));
+        onEvent({ type: 'final_text', iterations: 1, text: 'Sorry.' });
+        return { text: 'Sorry.', actions: [] };
+      });
+
+      render(<ChatPanel sendMessage={sendFn} />);
+      await act(async () => {
+        typeAndSend('try the bad thing');
+      });
+
+      // No button row appears
+      expect(screen.queryByRole('button')).toBeNull();
+    });
+  });
 });

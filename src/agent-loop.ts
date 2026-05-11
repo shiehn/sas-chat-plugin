@@ -25,12 +25,34 @@ import type {
 // Public types
 // ---------------------------------------------------------------------------
 
+/**
+ * A suggested follow-up the executor surfaces alongside a successful tool
+ * call. Structurally mirrors `OperationResult.nextSteps[]` from
+ * `sas-assistant/src/shared/types/tool-result.ts` but is declared locally so
+ * `agent-loop` stays decoupled from SAS-specific types (Errantry-PI and any
+ * future plugin can populate the field too).
+ */
+export interface AgentNextStep {
+  description: string;
+  cli?: string;
+  mcp?: { tool: string; args: Record<string, unknown> };
+  priority?: 'primary' | 'secondary';
+}
+
 /** Subset of `SasToolResult` the agent loop needs. */
 export interface ToolExecutionResult {
   success: boolean;
   exitCode: number;
   stdout: string;
   stderr: string;
+  /**
+   * Follow-up affordances. When non-empty AND `success === true`, the loop
+   * emits a `next_steps` event so the UI can render clickable buttons next
+   * to the tool's row. The executor is responsible for extracting these
+   * from whatever its underlying transport returns (e.g. `panel-tools.ts`
+   * pulls them out of the CLI's parsed OperationResult).
+   */
+  nextSteps?: AgentNextStep[];
 }
 
 /** One newline-delimited chunk of subprocess output, surfaced live by the executor. */
@@ -88,6 +110,20 @@ export type AgentLoopEvent =
       toolName: string;
       toolArgs: Record<string, unknown>;
       result: ToolExecutionResult;
+    }
+  | {
+      /**
+       * Follow-up suggestions surfaced after a successful tool call. Emitted
+       * immediately after `tool_call_done` when the executor populates
+       * `result.nextSteps` and the call succeeded. Purely a UI signal — the
+       * model already sees the full OperationResult JSON in the
+       * `functionResponse` payload it gets fed for the next turn.
+       */
+      type: 'next_steps';
+      iteration: number;
+      callId: string;
+      toolName: string;
+      steps: AgentNextStep[];
     }
   | { type: 'iteration_limit'; iterations: number }
   | { type: 'final_text'; iterations: number; text: string };
@@ -352,6 +388,19 @@ export class AgentLoop {
           toolArgs: args,
           result,
         });
+
+        // Surface follow-up suggestions only on success. A failed call's
+        // remediation belongs in the tool_call_done error path; conflating
+        // next_steps with recovery hints would muddle the UI affordance.
+        if (result.success && result.nextSteps && result.nextSteps.length > 0) {
+          emit({
+            type: 'next_steps',
+            iteration,
+            callId,
+            toolName: name,
+            steps: result.nextSteps,
+          });
+        }
 
         toolResponseParts.push({
           functionResponse: {

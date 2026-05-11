@@ -7,6 +7,8 @@
  * summary once the assistant's final text lands.
  */
 
+import type { AgentNextStep } from '../agent-loop';
+
 export type TerminalEntry =
   | { kind: 'user'; id: string; turnId: number; text: string }
   | {
@@ -60,6 +62,18 @@ export type TerminalEntry =
       callId: string;
       question: string;
       response: string;
+    }
+  /** Follow-up affordances surfaced by a successful tool call. Rendered as
+   *  a row of clickable buttons; the click submits the step's `description`
+   *  as a new user message so the LLM picks the matching tool on the next
+   *  turn. Stays visible after the turn collapses — it's an action
+   *  affordance, not a debug detail. */
+  | {
+      kind: 'next_steps';
+      id: string;
+      turnId: number;
+      callId: string;
+      steps: AgentNextStep[];
     }
   | {
       kind: 'assistant';

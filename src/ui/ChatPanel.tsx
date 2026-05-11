@@ -257,6 +257,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     [submitClarification]
   );
 
+  const handleNextStep = useCallback(
+    (description: string): void => {
+      // Submit the next-step's description as a new user message. The LLM
+      // sees the suggestion it just made in conversation history and picks
+      // the matching tool naturally. No-op while a turn is in flight — the
+      // AgentLoop would reject a concurrent run() anyway.
+      if (isProcessing) return;
+      void handleSend(description);
+    },
+    [isProcessing, handleSend]
+  );
+
   // Input box is disabled during processing UNLESS we're waiting on the
   // user's clarification — that's the one moment mid-turn the user is
   // expected to type.
@@ -278,6 +290,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         isProcessing={isProcessing}
         onToggleTurn={handleToggleTurn}
         onQuickReply={handleQuickReply}
+        onNextStep={handleNextStep}
       />
       <InputBox
         onSend={handleSend}
@@ -460,6 +473,20 @@ function applyEvent(
         },
       ];
     }
+
+    case 'next_steps':
+      // Append a row of clickable follow-up affordances. The row persists
+      // across turn collapse — see the visibleEntries filter in TerminalLog.
+      return [
+        ...entries,
+        {
+          kind: 'next_steps',
+          id: nextId(),
+          turnId,
+          callId: event.callId,
+          steps: event.steps,
+        },
+      ];
 
     case 'iteration_limit':
       return removeThinking(entries, turnId).map((e) =>

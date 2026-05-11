@@ -200,6 +200,119 @@ describe('AgentLoop', () => {
     }
   });
 
+  it('emits next_steps after a successful tool call when result.nextSteps is populated', async () => {
+    const host = makeScriptedHost([
+      toolCallResponse('dsl_shuffle_preset', { track: 'Snare' }),
+      textResponse('Done — try one of the suggestions.'),
+    ]);
+    const executor: ToolExecutor = jest.fn().mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      stdout: '{"success":true}',
+      stderr: '',
+      nextSteps: [
+        {
+          description: 'Try a different snare preset',
+          cli: 'sas dsl_shuffle_preset --track Snare',
+          mcp: { tool: 'dsl_shuffle_preset', args: { track: 'Snare' } },
+          priority: 'primary',
+        },
+        {
+          description: 'Add an FX rack to this track',
+          cli: 'sas dsl_set_track_fx --track Snare',
+          priority: 'secondary',
+        },
+      ],
+    } satisfies ToolExecutionResult);
+    const events: AgentLoopEvent[] = [];
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      onEvent: (e) => events.push(e),
+    });
+
+    await loop.run('reshuffle the snare');
+
+    // next_steps must land between tool_call_done and the next llm_call_start
+    // so the UI can render buttons before the loop continues.
+    const types = events.map((e) => e.type);
+    const doneIdx = types.indexOf('tool_call_done');
+    const stepsIdx = types.indexOf('next_steps');
+    expect(stepsIdx).toBe(doneIdx + 1);
+
+    const stepsEvent = events[stepsIdx];
+    if (stepsEvent.type !== 'next_steps') throw new Error('wrong event type');
+    expect(stepsEvent.toolName).toBe('dsl_shuffle_preset');
+    expect(stepsEvent.steps).toHaveLength(2);
+    expect(stepsEvent.steps[0].description).toBe('Try a different snare preset');
+    expect(stepsEvent.steps[0].priority).toBe('primary');
+    expect(stepsEvent.steps[1].cli).toBe('sas dsl_set_track_fx --track Snare');
+  });
+
+  it('does NOT emit next_steps when the tool call failed', async () => {
+    const host = makeScriptedHost([
+      toolCallResponse('dsl_shuffle_preset', { track: 'Nope' }),
+      textResponse('couldnt find that track'),
+    ]);
+    // Failed result that still carries nextSteps (defensive — the executor
+    // shouldn't, but the agent loop should not emit either way).
+    const executor: ToolExecutor = jest.fn().mockResolvedValue({
+      success: false,
+      exitCode: 1,
+      stdout: '',
+      stderr: 'track_not_found',
+      nextSteps: [
+        { description: 'try a different track', cli: 'sas scene_get_tracks' },
+      ],
+    } satisfies ToolExecutionResult);
+    const events: AgentLoopEvent[] = [];
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      onEvent: (e) => events.push(e),
+    });
+
+    await loop.run('shuffle nope');
+
+    expect(events.some((e) => e.type === 'next_steps')).toBe(false);
+  });
+
+  it('does NOT emit next_steps when result.nextSteps is empty or absent', async () => {
+    const host = makeScriptedHost([
+      toolCallResponse('scene_get_tracks', {}),
+      textResponse('ok'),
+    ]);
+    const executor: ToolExecutor = jest.fn().mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      stdout: '{}',
+      stderr: '',
+      // nextSteps deliberately omitted
+    } satisfies ToolExecutionResult);
+    const events: AgentLoopEvent[] = [];
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      onEvent: (e) => events.push(e),
+    });
+
+    await loop.run('list tracks');
+
+    expect(events.some((e) => e.type === 'next_steps')).toBe(false);
+  });
+
   it('stops at maxIterations with a cap message', async () => {
     const host = makeScriptedHost([
       toolCallResponse('scene_get_tracks', {}),
