@@ -90,6 +90,51 @@ export async function buildPanelTools(
   );
   const activeSceneId = host.getActiveSceneId();
 
+  // Lazy deferred-tool resolution. `host.listAppTools({ scope: 'scene' })`
+  // above intentionally hides tools registered with `deferLoading: true`
+  // (progressive-disclosure curation in the assistant's tool registry).
+  // BUT `tool_search` advertises those deferred tools to the agent, and
+  // Gemini will happily emit function-calls for them. If we rejected on
+  // first miss, the `tool_search → invoke` contract would be broken and
+  // every deferred composite (render_to_performance, create_transition,
+  // deck_*, audio_routing_*, history/undo, etc.) would be unreachable
+  // from chat. So on a miss we consult the FULL surface
+  // (`includeDeferred: true`) once, cache, and dispatch as normal.
+  //
+  // The CLI subprocess path (`invokeSas` → /api/v1/execute) does NOT
+  // check `deferLoading` — that flag gates discovery, not execution —
+  // so once we have a def, the rest of the executor is unchanged.
+  const deferredCache = new Map<string, PluginAppTool>();
+  let deferredListPromise: Promise<PluginAppTool[]> | null = null;
+
+  async function resolveDeferredTool(
+    toolName: string,
+  ): Promise<PluginAppTool | null> {
+    const cached = deferredCache.get(toolName);
+    if (cached) return cached;
+    if (!deferredListPromise) {
+      // Single-flight: concurrent misses for distinct deferred tools
+      // share one listAppTools call. The SDK type for `listAppTools`
+      // doesn't expose `includeDeferred` yet (a separate SDK 2.x bump
+      // can widen it); the cast keeps this fix self-contained.
+      // `PluginHostImpl` already honors the flag (see CLAUDE.md
+      // "Agent-facing tool discovery is a SINGLE surface").
+      deferredListPromise = (
+        host.listAppTools as (opts?: {
+          scope?: 'scene' | 'project';
+          includeDeferred?: boolean;
+        }) => Promise<PluginAppTool[]>
+      )({ includeDeferred: true }).catch((err) => {
+        // Reset so a transient failure doesn't poison subsequent calls.
+        deferredListPromise = null;
+        throw err;
+      });
+    }
+    const full = await deferredListPromise;
+    for (const t of full) deferredCache.set(t.name, t);
+    return deferredCache.get(toolName) ?? null;
+  }
+
   const executor: ToolExecutor = async (name, args, onProgress) => {
     if (name === ASK_USER_TOOL_NAME) {
       // Synthetic tool — bypass the CLI subprocess entirely. The host
@@ -134,17 +179,42 @@ export async function buildPanelTools(
       }
     }
 
-    const def = toolByName.get(name);
+    let def: PluginAppTool | null = toolByName.get(name) ?? null;
     if (!def) {
-      // Unknown tool — feed back a structured failure so the model can
-      // recover (e.g., re-pick from the actual list). Do not throw.
-      const known = appTools.map((t) => t.name).join(', ');
-      return {
-        success: false,
-        exitCode: 1,
-        stdout: '',
-        stderr: `Unknown tool '${name}'. Available scene-scoped tools: ${known}`,
-      };
+      // Not in the default scene-scoped surface — check the deferred
+      // surface (tools `tool_search` can advertise but that don't ship
+      // in the agent's default tool list).
+      try {
+        def = await resolveDeferredTool(name);
+      } catch (err) {
+        const stderr = err instanceof Error ? err.message : String(err);
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr: `Unable to look up deferred tool '${name}' (${stderr}).`,
+        };
+      }
+      if (!def) {
+        // Truly unknown — feed back a structured failure so the model
+        // can recover (e.g., re-pick from the actual list). Do not
+        // throw. Mention the deferred surface was also checked so the
+        // LLM doesn't loop trying tool_search again.
+        const known = appTools.map((t) => t.name).join(', ');
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr:
+            `Unknown tool '${name}'. Not in the default scene-scoped surface ` +
+            `and not in the deferred surface either. ` +
+            `Available scene-scoped tools: ${known}. ` +
+            `Use tool_search with different keywords if you need a different capability.`,
+        };
+      }
+      // Cache the resolved def so subsequent invocations skip the
+      // deferred-surface lookup entirely.
+      toolByName.set(name, def);
     }
 
     const params = injectActiveSceneId(args, def, activeSceneId);

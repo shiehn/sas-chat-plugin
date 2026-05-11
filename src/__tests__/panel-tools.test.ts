@@ -44,6 +44,39 @@ const SCENE_TOOLS: PluginAppTool[] = [
   },
 ];
 
+// Tools registered with `deferLoading: true` — `tool_search` advertises
+// them but `listAppTools({ scope: 'scene' })` filters them out. The
+// chat-plugin must resolve them on-demand when the agent invokes by name.
+const DEFERRED_ONLY_TOOLS: PluginAppTool[] = [
+  {
+    name: 'render_to_performance',
+    description: 'Render the scene to the performance deck',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sceneId: { type: 'string', description: 'Scene UUID' },
+        loopBars: { type: 'number', description: 'Loop bars' },
+      },
+      required: [],
+    },
+    scope: 'scene',
+  },
+  {
+    name: 'create_transition',
+    description: 'Create a transition between two scenes',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fromScene: { type: 'string' },
+        toScene: { type: 'string' },
+      },
+      required: ['fromScene', 'toScene'],
+    },
+    scope: 'project',
+  },
+];
+const FULL_TOOLS: PluginAppTool[] = [...SCENE_TOOLS, ...DEFERRED_ONLY_TOOLS];
+
 interface MockHost {
   listAppTools: jest.Mock;
   getActiveSceneId: jest.Mock;
@@ -197,6 +230,168 @@ describe('buildPanelTools', () => {
     expect(result.stderr).toContain("Unknown tool 'not_a_real_tool'");
     expect(result.stderr).toContain('scene_get_tracks');
     expect(mockInvokeSas).not.toHaveBeenCalled();
+  });
+
+  describe('deferred tool surface (tool_search → invoke contract)', () => {
+    // Mirrors the registry's progressive-disclosure split: `listAppTools`
+    // with `scope:'scene'` returns the curated default tools; with
+    // `includeDeferred:true` it returns the FULL surface (default +
+    // deferLoading=true tools). The chat-plugin must lazy-load deferred
+    // tools the agent reaches via tool_search.
+    function makeSplitHost(activeSceneId: string | null = 'scene-uuid-123'): {
+      listAppTools: jest.Mock;
+      getActiveSceneId: jest.Mock;
+    } {
+      return {
+        listAppTools: jest.fn().mockImplementation((opts?: { scope?: string; includeDeferred?: boolean }) => {
+          return Promise.resolve(opts?.includeDeferred ? FULL_TOOLS : SCENE_TOOLS);
+        }),
+        getActiveSceneId: jest.fn().mockReturnValue(activeSceneId),
+      };
+    }
+
+    it('(a) resolves a deferred tool on invoke and dispatches via the CLI', async () => {
+      const host = makeSplitHost('scene-uuid-abc');
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const result = await executor('render_to_performance', {});
+
+      expect(result.success).toBe(true);
+      // Build-time call (scope:'scene') + on-demand deferred call.
+      expect(host.listAppTools).toHaveBeenCalledTimes(2);
+      expect(host.listAppTools).toHaveBeenNthCalledWith(1, { scope: 'scene' });
+      expect(host.listAppTools).toHaveBeenNthCalledWith(2, { includeDeferred: true });
+      expect(mockInvokeSas).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'render_to_performance',
+          // sceneId injection still fires for deferred tools that declare
+          // a sceneId property.
+          params: { sceneId: 'scene-uuid-abc' },
+        }),
+      );
+    });
+
+    it('(b) caches the resolved deferred tool — second call hits the cache', async () => {
+      const host = makeSplitHost();
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      await executor('render_to_performance', {});
+      await executor('render_to_performance', {});
+
+      // Two invocations, but only ONE deferred-surface lookup
+      // (build-time scope:'scene' + one includeDeferred:true).
+      expect(host.listAppTools).toHaveBeenCalledTimes(2);
+      expect(mockInvokeSas).toHaveBeenCalledTimes(2);
+    });
+
+    it('(c) concurrent misses share one in-flight listAppTools call (single-flight)', async () => {
+      const host = makeSplitHost();
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+      // Reset the mock's history so the count below is unambiguous.
+      host.listAppTools.mockClear();
+
+      await Promise.all([
+        executor('render_to_performance', {}),
+        executor('create_transition', { fromScene: 'A', toScene: 'B' }),
+      ]);
+
+      // Two distinct deferred tools, but only ONE includeDeferred call —
+      // both resolutions awaited the same in-flight promise.
+      const calls = host.listAppTools.mock.calls;
+      const deferredCalls = calls.filter(
+        ([opts]) => (opts as { includeDeferred?: boolean })?.includeDeferred === true,
+      );
+      expect(deferredCalls.length).toBe(1);
+      expect(mockInvokeSas).toHaveBeenCalledTimes(2);
+    });
+
+    it('(d) truly bogus names still fail with a helpful error mentioning both surfaces', async () => {
+      const host = makeSplitHost();
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const result = await executor('frobnicate_synergy', {});
+
+      expect(result.success).toBe(false);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("Unknown tool 'frobnicate_synergy'");
+      expect(result.stderr).toContain('deferred surface either');
+      expect(result.stderr).toContain('scene_get_tracks'); // default list nudge
+      expect(mockInvokeSas).not.toHaveBeenCalled();
+    });
+
+    it('(e) deferred-lookup rejection returns a structured failure; in-flight handle clears so retry works', async () => {
+      const host = makeSplitHost();
+      // First includeDeferred call rejects; subsequent one succeeds.
+      let deferredCallCount = 0;
+      host.listAppTools.mockImplementation((opts?: { includeDeferred?: boolean }) => {
+        if (opts?.includeDeferred) {
+          deferredCallCount += 1;
+          if (deferredCallCount === 1) {
+            return Promise.reject(new Error('engine unreachable'));
+          }
+          return Promise.resolve(FULL_TOOLS);
+        }
+        return Promise.resolve(SCENE_TOOLS);
+      });
+
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const first = await executor('render_to_performance', {});
+      expect(first.success).toBe(false);
+      expect(first.stderr).toContain('Unable to look up deferred tool');
+      expect(first.stderr).toContain('engine unreachable');
+      expect(mockInvokeSas).not.toHaveBeenCalled();
+
+      // Retry — the in-flight handle was cleared, so this hits the
+      // (now successful) listAppTools impl and dispatches.
+      const second = await executor('render_to_performance', {});
+      expect(second.success).toBe(true);
+      expect(deferredCallCount).toBe(2);
+      expect(mockInvokeSas).toHaveBeenCalledTimes(1);
+    });
+
+    it('(f) cross-scope deferred tool (scope=project) still dispatches from a scene-scoped chat surface', async () => {
+      const host = makeSplitHost();
+      const { executor } = await buildPanelTools({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        host: host as any,
+        cliPaths: CLI_PATHS,
+      });
+
+      const result = await executor('create_transition', {
+        fromScene: 'Verse',
+        toScene: 'Chorus',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockInvokeSas).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'create_transition',
+          // create_transition has no sceneId in its schema, so no injection.
+          params: { fromScene: 'Verse', toScene: 'Chorus' },
+        }),
+      );
+    });
   });
 
   it('executor surfaces nextSteps from the CLI parsed OperationResult', async () => {
