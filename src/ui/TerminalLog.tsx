@@ -93,10 +93,37 @@ export const TerminalLog: React.FC<TerminalLogProps> = ({
     }
   }
 
+  // Workflow-progress rows are inlined under the owning ⚡ ToolRow the same
+  // way output lines are. We keep only the latest entry per callId (the
+  // reducer updates in place, but a defensive last-wins keeps us safe).
+  const workflowProgressByCallId = new Map<
+    string,
+    Extract<TerminalEntry, { kind: 'workflow_progress' }>
+  >();
+  for (const e of entries) {
+    if (e.kind === 'workflow_progress') {
+      workflowProgressByCallId.set(e.callId, e);
+    }
+  }
+
   const visibleEntries = entries.filter((e) => {
     // Output lines never render at their natural array position — the
     // owning ToolRow inlines them.
     if (e.kind === 'tool_output_line') return false;
+    // Workflow-progress rows are inlined into the owning ToolRow by callId
+    // when a matching tool_pending/tool_done exists. Otherwise (orphan /
+    // late event), fall through and render the row at its natural slot so
+    // the signal isn't lost. Hidden when the turn collapses (scratch
+    // state, not a persistent action affordance like next_steps).
+    if (e.kind === 'workflow_progress') {
+      const hasOwner = entries.some(
+        (o) =>
+          (o.kind === 'tool_pending' || o.kind === 'tool_done') &&
+          o.callId === e.callId,
+      );
+      if (hasOwner) return false;
+      return !collapsedTurns.has(e.turnId);
+    }
     if (e.kind !== 'tool_pending' && e.kind !== 'tool_done') return true;
     return !collapsedTurns.has(e.turnId);
   });
@@ -126,6 +153,7 @@ export const TerminalLog: React.FC<TerminalLogProps> = ({
           onQuickReply={onQuickReply}
           onNextStep={onNextStep}
           outputLinesByCallId={outputLinesByCallId}
+          workflowProgressByCallId={workflowProgressByCallId}
         />
       ))}
       {isProcessing && <ProcessingCursor />}
@@ -147,6 +175,10 @@ interface EntryRowProps {
     string,
     Array<Extract<TerminalEntry, { kind: 'tool_output_line' }>>
   >;
+  workflowProgressByCallId: Map<
+    string,
+    Extract<TerminalEntry, { kind: 'workflow_progress' }>
+  >;
 }
 
 const EntryRow: React.FC<EntryRowProps> = ({
@@ -156,6 +188,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
   onQuickReply,
   onNextStep,
   outputLinesByCallId,
+  workflowProgressByCallId,
 }) => {
   const spacing = needsTopSpacing(entry, previous) ? 8 : 0;
 
@@ -191,6 +224,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
           pending
           spacing={spacing}
           progressLines={outputLinesByCallId.get(entry.callId) ?? []}
+          workflowProgress={workflowProgressByCallId.get(entry.callId)}
         />
       );
 
@@ -220,6 +254,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
           pending={false}
           spacing={spacing}
           progressLines={outputLinesByCallId.get(entry.callId) ?? []}
+          workflowProgress={workflowProgressByCallId.get(entry.callId)}
         />
       );
 
@@ -280,6 +315,13 @@ const EntryRow: React.FC<EntryRowProps> = ({
       return (
         <NextStepsRow entry={entry} spacing={spacing} onNextStep={onNextStep} />
       );
+
+    case 'workflow_progress':
+      // Orphan render path — the entry exists with no matching ToolRow to
+      // host it (e.g. progress arrived before tool_call_start, or after
+      // tool_call_done unwound). Render standalone so the signal isn't
+      // dropped.
+      return <WorkflowProgressBlock entry={entry} spacing={spacing} />;
   }
 };
 
@@ -402,6 +444,7 @@ interface ToolRowProps {
   pending: boolean;
   spacing: number;
   progressLines: Array<Extract<TerminalEntry, { kind: 'tool_output_line' }>>;
+  workflowProgress?: Extract<TerminalEntry, { kind: 'workflow_progress' }>;
 }
 
 const ToolRow: React.FC<ToolRowProps> = ({
@@ -409,6 +452,7 @@ const ToolRow: React.FC<ToolRowProps> = ({
   pending,
   spacing,
   progressLines,
+  workflowProgress,
 }) => {
   const paramStr = formatParams(entry.params);
   const isError = entry.error !== undefined;
@@ -426,6 +470,7 @@ const ToolRow: React.FC<ToolRowProps> = ({
           <span style={{ color: COLOR.muted }}>{' ' + paramStr}</span>
         )}
       </div>
+      {workflowProgress && <WorkflowProgressLines entry={workflowProgress} />}
       {progressLines.map((line) => (
         <div
           key={line.id}
@@ -453,6 +498,78 @@ const ToolRow: React.FC<ToolRowProps> = ({
           </span>
         </div>
       )}
+    </div>
+  );
+};
+
+interface WorkflowProgressLinesProps {
+  entry: Extract<TerminalEntry, { kind: 'workflow_progress' }>;
+}
+
+const STATUS_GLYPH: Record<
+  Extract<TerminalEntry, { kind: 'workflow_progress' }>['items'][number]['status'],
+  string
+> = {
+  planned: '·',
+  running: '⊙',
+  completed: '✓',
+  failed: '✗',
+};
+
+const WorkflowProgressLines: React.FC<WorkflowProgressLinesProps> = ({
+  entry,
+}) => {
+  return (
+    <div data-role="workflow-progress" data-call-id={entry.callId}>
+      {entry.label && (
+        <div style={{ color: COLOR.muted, opacity: 0.85 }}>
+          {'    ┊ '}
+          {entry.label}
+        </div>
+      )}
+      {entry.items.map((item, i) => {
+        const isFailed = item.status === 'failed';
+        const isRunning = item.status === 'running';
+        const isPlanned = item.status === 'planned';
+        return (
+          <div
+            key={`${entry.callId}-${i}-${item.name}`}
+            data-role="workflow-progress-item"
+            data-status={item.status}
+            title={item.error}
+            style={{
+              color: isFailed ? COLOR.error : COLOR.muted,
+              opacity: isPlanned ? 0.45 : 0.85,
+            }}
+          >
+            <span>{'    ┊   '}</span>
+            <span className={isRunning ? 'sas-chat-blink' : undefined}>
+              {STATUS_GLYPH[item.status]}
+            </span>
+            <span>{' '}</span>
+            <span>{item.name}</span>
+            {isFailed && item.error && (
+              <span style={{ opacity: 0.7 }}>{' (' + item.error + ')'}</span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+interface WorkflowProgressBlockProps {
+  entry: Extract<TerminalEntry, { kind: 'workflow_progress' }>;
+  spacing: number;
+}
+
+const WorkflowProgressBlock: React.FC<WorkflowProgressBlockProps> = ({
+  entry,
+  spacing,
+}) => {
+  return (
+    <div style={{ marginTop: spacing }}>
+      <WorkflowProgressLines entry={entry} />
     </div>
   );
 };

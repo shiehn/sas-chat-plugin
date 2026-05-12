@@ -32,6 +32,7 @@ export type {
   AgentLoopEventHandler,
   ToolExecutor,
   ToolExecutionResult,
+  WorkflowProgressItem,
 } from './agent-loop';
 export type { SasToolInvocation, SasToolResult } from './sas-tool-handler';
 export type {

@@ -488,6 +488,37 @@ function applyEvent(
         },
       ];
 
+    case 'workflow_progress': {
+      // Update-in-place by callId — items[] is a full snapshot every emit,
+      // so we just replace it. If no row exists yet (first emit), append a
+      // new one. Late events whose callId never matched a tool_call_start
+      // still create a fallback row so we don't drop the signal.
+      const idx = entries.findIndex(
+        (e) =>
+          e.kind === 'workflow_progress' &&
+          e.turnId === turnId &&
+          e.callId === event.callId,
+      );
+      if (idx >= 0) {
+        return entries.map((e, i) =>
+          i === idx && e.kind === 'workflow_progress'
+            ? { ...e, items: event.items, label: event.label ?? e.label }
+            : e,
+        );
+      }
+      return [
+        ...entries,
+        {
+          kind: 'workflow_progress',
+          id: nextId(),
+          turnId,
+          callId: event.callId,
+          label: event.label,
+          items: event.items,
+        },
+      ];
+    }
+
     case 'iteration_limit':
       return removeThinking(entries, turnId).map((e) =>
         e.kind === 'assistant' && e.turnId === turnId

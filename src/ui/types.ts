@@ -7,7 +7,7 @@
  * summary once the assistant's final text lands.
  */
 
-import type { AgentNextStep } from '../agent-loop';
+import type { AgentNextStep, WorkflowProgressItem } from '../agent-loop';
 
 export type TerminalEntry =
   | { kind: 'user'; id: string; turnId: number; text: string }
@@ -74,6 +74,18 @@ export type TerminalEntry =
       turnId: number;
       callId: string;
       steps: AgentNextStep[];
+    }
+  /** Incremental sub-task status for a long-running tool. Inlined inside
+   *  the owning ⚡ ToolRow keyed by `callId`. Mutated in place — one row
+   *  per callId, items list replaces fully on each emission. Hidden when
+   *  the turn collapses (scratch state, not an action affordance). */
+  | {
+      kind: 'workflow_progress';
+      id: string;
+      turnId: number;
+      callId: string;
+      label?: string;
+      items: WorkflowProgressItem[];
     }
   | {
       kind: 'assistant';

@@ -62,6 +62,27 @@ export interface ToolProgressChunk {
 }
 
 /**
+ * One item inside a `workflow_progress` event. Used to surface incremental
+ * status for long-running tools that internally fan out into sub-tasks the
+ * agent loop can't see (e.g. `compose_scene`'s per-track MIDI generation).
+ *
+ * The UI groups items by the parent tool call's `callId` and renders them
+ * inline under that ⚡ row.
+ */
+export interface WorkflowProgressItem {
+  /** Human-readable label, e.g. a track description or role. */
+  name: string;
+  /**
+   * 'planned'   — queued, not started yet
+   * 'running'   — currently in progress
+   * 'completed' — finished successfully
+   * 'failed'    — finished with an error (see `error`)
+   */
+  status: 'planned' | 'running' | 'completed' | 'failed';
+  error?: string;
+}
+
+/**
  * Executes a tool call. Returning a result (success or failure) lets the
  * model recover from errors; throwing should be reserved for truly
  * exceptional cases (spawn failure, timeout) and is wrapped into a
@@ -124,6 +145,27 @@ export type AgentLoopEvent =
       callId: string;
       toolName: string;
       steps: AgentNextStep[];
+    }
+  | {
+      /**
+       * Incremental progress for a long-running tool that fans out into
+       * sub-tasks the agent loop can't see directly (e.g. `compose_scene`'s
+       * per-track MIDI generation). The host bridges these from a
+       * domain-specific progress signal — the agent loop itself never
+       * emits this; only the host's external translator does.
+       *
+       * `items` is a full snapshot every emission (not a delta), so the
+       * reducer just replaces the row's items in place. `callId` MUST
+       * match a prior `tool_call_start.callId` so the UI can inline the
+       * progress under the owning ⚡ row.
+       */
+      type: 'workflow_progress';
+      /** Associates with a prior `tool_call_start.callId`. */
+      callId: string;
+      /** Optional header, e.g. "Generating MIDI (4 tracks)". */
+      label?: string;
+      /** Full snapshot of the sub-task list. */
+      items: WorkflowProgressItem[];
     }
   | { type: 'iteration_limit'; iterations: number }
   | { type: 'final_text'; iterations: number; text: string };

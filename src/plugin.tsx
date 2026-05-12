@@ -123,6 +123,13 @@ How to work:
 - Be concise. The user can hear the result; explanations are for when something needs explaining.
 - Your default tool list is scene-scoped. For project-wide actions (deck control "play loop-a / loop-b", audio routing, project switching, transitions, history/undo, audio export), call \`tool_search\` with a keyword query FIRST — most capabilities not on your default list are reachable that way, then invoke the returned tool by name.
 
+Answering arbitrary state questions ("how many AI tracks in scene X", "which track has the most plugins", "is the system performing well"):
+- \`db_query\` runs a read-only SELECT / WITH / PRAGMA against the app's SQLite database and returns rows. Pair it with \`db_describe_schema\` (the "ls" of the DB) the first time you touch an unfamiliar table.
+- Scope every query on \`tracks\` / \`audio_tracks\` / \`sample_tracks\` with \`AND project_id = ?\` — these tables share IDs across projects. Get the active project_id from \`project_get_status\`. The "engine_track_id" / "scene_id" / etc. are NOT globally unique.
+- For per-plugin parameter values (e.g. "what's the decay on the reverb on Bass?") use \`fx_list_plugins\` then \`fx_list_params\` — plugin parameter state lives in the audio engine, not the DB.
+- For audio dropouts / engine health / "is everything OK?" use \`system_get_health\` — quote its \`verdict\` and \`notes\` directly in your reply.
+- These three read primitives are always visible — don't tool_search for them.
+
 When to ask vs proceed:
 - Default to action. For routine intents ("add reverb to the bass", "make drums punchier") pick a sensible default and proceed — the user can hear the result and can undo via \`history undo\`.
 - ONLY call \`ask_user\` when the request is genuinely ambiguous AND a wrong guess would cost real work. Examples: multiple equally-valid candidates ("the bass" with three bass tracks of different roles), missing a load-bearing parameter ("shorten the intro" with no scene specified), an interpretation that would overwrite user intent.
@@ -335,6 +342,20 @@ export class ChatPanelPlugin implements GeneratorPlugin {
         },
       },
     ];
+  }
+
+  /**
+   * Drop the agent's conversation history without tearing down activation.
+   *
+   * Production callers: hands-off — `onSceneChanged` already does this on
+   * scene switches. Test callers (the Errantry bridge `/errantry/reset`
+   * handler) need it because the SEED path (`/api/v1/execute scene_activate`)
+   * mutates engine state without going through the plugin lifecycle, so the
+   * chat history would otherwise leak across specs and PI would reply
+   * about stale tracks from prior runs.
+   */
+  reset(): void {
+    this.agent?.reset();
   }
 
   async onSceneChanged(_sceneId: string | null): Promise<void> {
