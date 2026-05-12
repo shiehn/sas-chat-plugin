@@ -202,7 +202,7 @@ export interface AgentLoopResult {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_ITERATIONS = 10;
-const DEFAULT_MODEL = 'gemini-2.5-flash';
+const DEFAULT_MODEL = 'gemini-2.5-pro';
 
 // ---------------------------------------------------------------------------
 // Implementation
