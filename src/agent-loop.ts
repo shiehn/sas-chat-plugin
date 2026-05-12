@@ -306,6 +306,15 @@ export class AgentLoop {
     });
 
     let iteration = 0;
+    /** Tracks empty-content retries (no tool calls + no text) on a per-iteration
+     *  basis. Gemini occasionally returns `stopReason: STOP` with zero parts
+     *  for clear actionable prompts ("Set tempo to 120", "Rename Old to New")
+     *  — a transient model hiccup we recover from by re-issuing the same
+     *  request once. If the retry also comes back empty, we fall through to
+     *  the normal terminal-turn handling (which surfaces an empty-text
+     *  diagnostic to the user). */
+    let emptyRetriesUsed = 0;
+    const MAX_EMPTY_RETRIES = 1;
     while (iteration < this.maxIterations) {
       iteration++;
 
@@ -378,6 +387,20 @@ export class AgentLoop {
       const parts = candidate.content.parts;
       const toolCallParts = parts.filter(hasFunctionCall);
       const textParts = parts.filter(hasText);
+
+      // Empty-content retry: Gemini sometimes returns stopReason=STOP with
+      // zero parts for clear tool-calling prompts. Pop the just-pushed empty
+      // model turn and retry the same iteration once before giving up.
+      if (
+        toolCallParts.length === 0 &&
+        textParts.length === 0 &&
+        emptyRetriesUsed < MAX_EMPTY_RETRIES
+      ) {
+        emptyRetriesUsed++;
+        this.contents.pop(); // drop the empty model turn we just appended
+        iteration--; // re-enter the same iteration cleanly
+        continue;
+      }
 
       // No tool calls → terminal turn.
       if (toolCallParts.length === 0) {
