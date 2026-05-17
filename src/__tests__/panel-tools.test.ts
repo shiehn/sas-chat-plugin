@@ -6,7 +6,7 @@
  * spawning a subprocess.
  */
 
-import { ASK_USER_TOOL_NAME, buildAmbientContext, buildPanelTools, extractNextSteps } from '../panel-tools';
+import { ASK_USER_TOOL_NAME, buildAmbientContext, buildPanelTools, extractNextSteps, _resetAmbientCacheForTests } from '../panel-tools';
 import * as toolHandler from '../sas-tool-handler';
 import type { PluginAppTool } from '@signalsandsorcery/plugin-sdk';
 
@@ -1033,5 +1033,125 @@ describe('buildAmbientContext', () => {
     expect(text).toContain('"Lone"');
     expect(text).not.toContain('Active scene name:');
     expect(text).not.toContain('Active scene id  :');
+  });
+
+  // -----------------------------------------------------------------------
+  // C-5 / §2.6 mutation-seq cache invalidation
+  // -----------------------------------------------------------------------
+
+  describe('cache (mutation-seq + TTL fallback)', () => {
+    function makeSeqHost(opts: {
+      sceneId?: string | null;
+      initialSeq?: number;
+    } = {}) {
+      let seq = opts.initialSeq ?? 0;
+      let sceneId = opts.sceneId ?? 'scene-aaaa1111-2222-3333-4444-555555555555';
+      const execute = jest.fn(async () => ({
+        success: true,
+        action: 'sas_inspect_project',
+        message: 'ok',
+        data: {
+          success: true,
+          action: 'sas_inspect_project',
+          changes: {
+            project: { id: 'p1', name: 'Demo', activeSceneId: sceneId },
+            scenes: sceneId ? [{ id: sceneId, name: 'S', displayName: 'S' }] : [],
+            tracks: [],
+          },
+        },
+      }));
+      return {
+        execute,
+        bumpSeq: (): void => {
+          seq++;
+        },
+        setSceneId: (id: string | null): void => {
+          sceneId = id;
+        },
+        host: {
+          executeAppTool: execute,
+          getActiveSceneId: jest.fn(() => sceneId),
+          getMutationSeq: jest.fn(() => seq),
+        },
+      };
+    }
+
+    it('returns cached preamble when active scene + mutation seq are unchanged', async () => {
+      const h = makeSeqHost({ initialSeq: 5 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(h.host as any);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const first = await buildAmbientContext(h.host as any);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const second = await buildAmbientContext(h.host as any);
+
+      expect(first).toBe(second);
+      // One inspect call total — the second invocation hit cache.
+      expect(h.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('invalidates cache when getMutationSeq() changes (any mutation)', async () => {
+      const h = makeSeqHost({ initialSeq: 5 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(h.host as any);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await buildAmbientContext(h.host as any);
+      h.bumpSeq();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await buildAmbientContext(h.host as any);
+
+      // Re-inspected because a mutation occurred between turns.
+      expect(h.execute).toHaveBeenCalledTimes(2);
+    });
+
+    it('invalidates immediately on active-scene change (even without a mutation)', async () => {
+      const h = makeSeqHost({ initialSeq: 5 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(h.host as any);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await buildAmbientContext(h.host as any);
+      h.setSceneId('scene-bbbb2222-2222-3333-4444-555555555555');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await buildAmbientContext(h.host as any);
+
+      expect(h.execute).toHaveBeenCalledTimes(2);
+    });
+
+    it('falls back to TTL when host predates SDK 2.6 (no getMutationSeq)', async () => {
+      // Same host shape as makeSeqHost, but without getMutationSeq.
+      const sceneId = 'scene-aaaa1111-2222-3333-4444-555555555555';
+      const execute = jest.fn(async () => ({
+        success: true,
+        action: 'sas_inspect_project',
+        message: 'ok',
+        data: {
+          success: true,
+          action: 'sas_inspect_project',
+          changes: {
+            project: { id: 'p1', name: 'Demo', activeSceneId: sceneId },
+            scenes: [{ id: sceneId, name: 'S', displayName: 'S' }],
+            tracks: [],
+          },
+        },
+      }));
+      const host = {
+        executeAppTool: execute,
+        getActiveSceneId: jest.fn(() => sceneId),
+        // No getMutationSeq.
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(host as any);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await buildAmbientContext(host as any);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await buildAmbientContext(host as any);
+
+      // Hit the cache via TTL — both calls within the 5s window.
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
   });
 });

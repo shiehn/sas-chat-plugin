@@ -432,18 +432,23 @@ const AMBIENT_MAX_SCENES = 12;
 const AMBIENT_MAX_TRACKS = 16;
 const AMBIENT_MAX_HISTORY = 3;
 
-/** Bound the ambient cache by recency, not by mutation seq (the host SDK
- *  doesn't expose one yet). Short enough that a tool mutation followed by a
- *  user message still pulls fresh state; long enough that a burst of agent
- *  turns within seconds doesn't repeatedly re-inspect the project. Resolves
- *  C-5 in `docs/chat-cli-architecture.md`. */
+/** Time-based fallback for hosts that don't yet expose `getMutationSeq()`
+ *  (SDK pre-2.6). Hosts on the new contract use the monotonic counter
+ *  directly and the TTL becomes irrelevant. Resolves C-5 +
+ *  the §2.6 mutation-seq follow-up in `docs/chat-cli-architecture.md`. */
 const AMBIENT_CACHE_TTL_MS = 5_000;
 
 interface AmbientCacheEntry {
   /** Active scene id at compute time. Cache invalidates immediately when this changes. */
   activeSceneId: string | null;
-  /** Wallclock ms of compute. Cache expires after AMBIENT_CACHE_TTL_MS. */
+  /** Wallclock ms of compute. Used by the TTL fallback path only. */
   ts: number;
+  /**
+   * Mutation-seq snapshot at compute time. When `host.getMutationSeq()`
+   * is available and unchanged, the cache is valid regardless of age.
+   * `null` when the host predates SDK 2.6 (we fall back to TTL).
+   */
+  mutationSeq: number | null;
   /** The rendered preamble string. */
   ambient: string;
 }
@@ -494,19 +499,36 @@ interface AmbientHistory {
  *  Equivalent to Claude Code injecting `git status` + tree + CLAUDE.md every
  *  turn — cheap recurring context beats expensive recovery via tool calls. */
 export async function buildAmbientContext(host: PluginHost): Promise<string> {
-  // Cache fast-path. The same active scene with a recent compute returns
-  // the cached preamble — most chat turns happen within seconds of each
-  // other and the broad project structure doesn't change between them.
-  // Active-scene changes blow the cache immediately; the TTL covers
-  // other-state changes (tracks/history) at coarse granularity.
+  // Cache fast-path. The same active scene with no observed mutations
+  // (preferred) or a recent compute (TTL fallback) returns the cached
+  // preamble. Active-scene change blows the cache immediately.
   const activeSceneIdFromHost = host.getActiveSceneId() ?? null;
+  // `getMutationSeq` is SDK 2.6+. Optional-chain so older hosts fall
+  // through to the TTL path silently.
+  const currentSeq: number | null =
+    typeof (host as { getMutationSeq?: () => number }).getMutationSeq === 'function'
+      ? (host as { getMutationSeq: () => number }).getMutationSeq()
+      : null;
   const cached = ambientCache.get(host);
-  if (
-    cached &&
-    cached.activeSceneId === activeSceneIdFromHost &&
-    Date.now() - cached.ts < AMBIENT_CACHE_TTL_MS
-  ) {
-    return cached.ambient;
+  if (cached && cached.activeSceneId === activeSceneIdFromHost) {
+    // Preferred: mutation-seq-keyed invalidation. No mutation since last
+    // compute → cache is valid no matter how old.
+    if (
+      currentSeq !== null &&
+      cached.mutationSeq !== null &&
+      cached.mutationSeq === currentSeq
+    ) {
+      return cached.ambient;
+    }
+    // Fallback: TTL. Activates when the host doesn't yet implement
+    // `getMutationSeq()` (older SDK) OR when the prior entry was cached
+    // before we had a seq snapshot to compare against.
+    if (
+      (currentSeq === null || cached.mutationSeq === null) &&
+      Date.now() - cached.ts < AMBIENT_CACHE_TTL_MS
+    ) {
+      return cached.ambient;
+    }
   }
 
   try {
@@ -618,6 +640,7 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
     ambientCache.set(host, {
       activeSceneId: activeSceneIdFromHost,
       ts: Date.now(),
+      mutationSeq: currentSeq,
       ambient,
     });
     return ambient;
