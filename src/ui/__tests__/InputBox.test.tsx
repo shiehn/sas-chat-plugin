@@ -110,5 +110,31 @@ describe('InputBox', () => {
       render(<InputBox onSend={jest.fn()} autoFocus={false} />);
       expect(document.activeElement).not.toBe(screen.getByRole('textbox'));
     });
+
+    it('re-focuses the textarea when isExpanded flips false → true', () => {
+      const { rerender } = render(
+        <InputBox onSend={jest.fn()} autoFocus={false} isExpanded={false} />,
+      );
+      // Collapsed + no mount autoFocus = textarea is not focused.
+      const textarea = screen.getByRole('textbox');
+      expect(document.activeElement).not.toBe(textarea);
+
+      // Simulate the user clicking elsewhere before the panel opens.
+      const decoy = document.createElement('button');
+      document.body.appendChild(decoy);
+      decoy.focus();
+      expect(document.activeElement).toBe(decoy);
+
+      // Now the host expands the section.
+      rerender(<InputBox onSend={jest.fn()} autoFocus={false} isExpanded={true} />);
+      expect(document.activeElement).toBe(textarea);
+
+      document.body.removeChild(decoy);
+    });
+
+    it('does NOT focus when isExpanded is true but disabled', () => {
+      render(<InputBox onSend={jest.fn()} autoFocus={false} isExpanded={true} disabled />);
+      expect(document.activeElement).not.toBe(screen.getByRole('textbox'));
+    });
   });
 });

@@ -726,6 +726,69 @@ describe('AgentLoop', () => {
     expect(thirdCall.contents[0].parts[0].text).toBe('next request');
   });
 
+  it('defers reset() requests fired by the host-level onSceneChanged path', async () => {
+    /**
+     * Integration-style companion to the executor-triggered test above.
+     * Models the actual production code path: the chat-plugin subscribes
+     * to `host.on('sceneChange', ...)` and calls `agent.reset()` in the
+     * handler. We simulate that wiring with a tiny event emitter so the
+     * test exercises "tool fires → host broadcasts scene change → handler
+     * reaches into AgentLoop.reset() while it's still awaiting" — same
+     * shape as the real onSceneChanged plumbing.
+     *
+     * Covers C-8 in `docs/chat-cli-architecture.md`. The earlier test calls
+     * `loop.reset()` directly; this test ensures the deferral also works
+     * when reset arrives via the listener edge.
+     */
+    const sceneListeners: Array<() => void> = [];
+    const emitSceneChange = (): void => {
+      for (const l of sceneListeners) l();
+    };
+
+    const host = makeScriptedHost([
+      toolCallResponse('compose_scene', { description: 'A simple beat' }),
+      textResponse('Composed.'),
+    ]);
+
+    let loopRef: AgentLoop | null = null;
+    const executor: ToolExecutor = jest.fn().mockImplementation(async () => {
+      // Tool execution side-effect emits a scene change — listeners fire
+      // synchronously and one of them calls reset().
+      emitSceneChange();
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: JSON.stringify({ success: true }),
+        stderr: '',
+      };
+    });
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+    loopRef = loop;
+    sceneListeners.push(() => loopRef!.reset());
+
+    const result = await loop.run('make a beat');
+    expect(result.text).toBe('Composed.');
+    expect(result.iterations).toBe(2);
+
+    // Iter 2 must carry [user, model(toolCall), user(funcResp)] — same
+    // shape the direct-reset case requires. The deferral guard makes this
+    // path identical regardless of who called reset().
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: Array<{ role: string; parts: unknown[] }>;
+    };
+    expect(secondCall.contents).toHaveLength(3);
+    expect(secondCall.contents[0].role).toBe('user');
+    expect(secondCall.contents[1].role).toBe('model');
+    expect(secondCall.contents[2].role).toBe('user');
+  });
+
   it('emits llm_call_start before generateWithLLMTools and llm_call_end after (success path)', async () => {
     const host = makeScriptedHost([textResponse('hi')]);
     const events: AgentLoopEvent[] = [];
@@ -946,6 +1009,90 @@ describe('AgentLoop', () => {
     resolveExecutor!();
     await firstRun;
   });
+
+  it('appends ambient context to systemInstruction when getAmbientContext is provided', async () => {
+    const host = makeScriptedHost([textResponse('done')]);
+    const executor: ToolExecutor = jest.fn();
+    const ambient = '=== Current state ===\nProject: "Demo"\nActive scene: "Verse 1"\n=== End ===';
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      getAmbientContext: async () => ambient,
+    });
+
+    await loop.run('hello');
+
+    const callArgs = host.generateWithLLMTools.mock.calls[0][0] as {
+      systemInstruction: { parts: Array<{ text: string }> };
+    };
+    const sysText = callArgs.systemInstruction.parts[0].text;
+    expect(sysText).toContain(SYSTEM_PROMPT);
+    expect(sysText).toContain('Project: "Demo"');
+    expect(sysText).toContain('Active scene: "Verse 1"');
+  });
+
+  it('proceeds without ambient context when the callback throws', async () => {
+    const host = makeScriptedHost([textResponse('done')]);
+    const executor: ToolExecutor = jest.fn();
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      getAmbientContext: async () => {
+        throw new Error('inspect failed');
+      },
+    });
+
+    const result = await loop.run('hello');
+    expect(result.text).toBe('done');
+
+    const callArgs = host.generateWithLLMTools.mock.calls[0][0] as {
+      systemInstruction: { parts: Array<{ text: string }> };
+    };
+    expect(callArgs.systemInstruction.parts[0].text).toBe(SYSTEM_PROMPT);
+  });
+
+  it('reuses the same ambient context across iterations within one run', async () => {
+    const host = makeScriptedHost([
+      toolCallResponse('scene_get_tracks', {}),
+      textResponse('done'),
+    ]);
+    const executor: ToolExecutor = jest.fn().mockResolvedValue({
+      success: true, exitCode: 0, stdout: '{}', stderr: '',
+    });
+    let ambientCalls = 0;
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: executor,
+      systemPrompt: SYSTEM_PROMPT,
+      getAmbientContext: async () => {
+        ambientCalls++;
+        return '[ambient]';
+      },
+    });
+
+    await loop.run('do it');
+
+    expect(ambientCalls).toBe(1); // ONE call per run, not per iteration
+    // But injected on every iteration's request:
+    const calls = host.generateWithLLMTools.mock.calls;
+    expect(calls.length).toBe(2);
+    for (const c of calls) {
+      const sys = (c[0] as { systemInstruction: { parts: Array<{ text: string }> } })
+        .systemInstruction.parts[0].text;
+      expect(sys).toContain('[ambient]');
+    }
+  });
 });
 
 describe('truncateForLLM', () => {
@@ -954,14 +1101,124 @@ describe('truncateForLLM', () => {
     expect(truncateForLLM(small)).toBe(small);
   });
 
-  it('keeps both head and tail with a marker in between for oversized strings', () => {
+  it('keeps both head and tail with a marker in between for non-JSON oversized strings', () => {
     const big = 'a'.repeat(2_400) + 'MIDDLE_MARKER'.repeat(200) + 'z'.repeat(1_200);
     const result = truncateForLLM(big);
     expect(result.length).toBeLessThan(big.length);
     expect(result).toMatch(/truncated/);
     expect(result.startsWith('a')).toBe(true);
     expect(result.endsWith('z')).toBe(true);
-    // The middle marker should be gone (it's in the truncated region).
     expect(result.includes('MIDDLE_MARKER')).toBe(false);
+  });
+
+  it('preserves clarification + remediation envelopes even when the payload is huge', () => {
+    // Build an OperationResult with a 4-option clarification AND a bulky
+    // changes payload that pushes the whole thing well over the cap. The
+    // agent MUST receive every clarification option so it can call ask_user.
+    const candidates = [
+      { id: 'scene-a1b2', name: 'Bass thing', displayName: 'Bass thing', genre: 'lofi', key: 'C', lengthBars: 4 },
+      { id: 'scene-c3d4', name: 'Funky bass', displayName: 'Funky bass', genre: 'funk', key: 'F', lengthBars: 8 },
+      { id: 'scene-e5f6', name: 'Bassline draft', displayName: 'Bassline draft', genre: 'house', key: 'A', lengthBars: 4 },
+      { id: 'scene-g7h8', name: 'Sub bass', displayName: 'Sub bass', genre: 'dnb', key: 'D', lengthBars: 2 },
+    ];
+    const envelope = {
+      success: false,
+      action: 'play_scene',
+      message: "Selector 'bass scene' matches 4 scenes",
+      error: 'ambiguous_selector',
+      remediation: {
+        type: 'clarification_needed',
+        reason: "'bass scene' matches 4 scenes",
+        fix: 'Pick one with the resolved id and retry play_scene.',
+      },
+      clarification: {
+        question: 'Which scene did you mean by "bass scene"?',
+        context: '4 scenes match.',
+        options: candidates.map((c) => ({ label: c.name, detail: `id=${c.id}`, value: c.id })),
+      },
+      changes: {
+        availableScenes: candidates,
+        // Bulk junk that pushes the payload way past LLM_OUTPUT_CAP. In real
+        // life this might be the full project state snapshot.
+        debugSnapshot: 'x'.repeat(8_000),
+      },
+    };
+    const json = JSON.stringify(envelope);
+    expect(json.length).toBeGreaterThan(4_000);
+
+    const result = truncateForLLM(json);
+    // The result must still be parseable JSON (envelope-aware path).
+    const reparsed = JSON.parse(result);
+    expect(reparsed.success).toBe(false);
+    expect(reparsed.error).toBe('ambiguous_selector');
+    expect(reparsed.remediation.type).toBe('clarification_needed');
+    expect(reparsed.remediation.fix).toBeTruthy();
+    expect(reparsed.clarification.question).toBe('Which scene did you mean by "bass scene"?');
+    expect(reparsed.clarification.options).toHaveLength(4);
+    // availableScenes preserved (4 items, all under MAX_CANDIDATE_ITEMS).
+    expect(reparsed.changes.availableScenes).toHaveLength(4);
+    expect(reparsed.changes.availableScenes[0].id).toBe('scene-a1b2');
+  });
+
+  it('trims bulky db_query rows with a "more rows" hint instead of head/tail-slicing JSON', () => {
+    const rows = Array.from({ length: 100 }, (_, i) => ({ id: `row-${i}`, name: `Track ${i}`, role: 'bass', volume: 0.7 }));
+    const envelope = {
+      success: true,
+      action: 'db_query',
+      message: 'Returned 100 rows',
+      changes: { rows, rowCount: 100, columns: ['id', 'name', 'role', 'volume'], truncated: false },
+    };
+    const json = JSON.stringify(envelope);
+    expect(json.length).toBeGreaterThan(4_000);
+
+    const result = truncateForLLM(json);
+    const reparsed = JSON.parse(result);
+    expect(reparsed.success).toBe(true);
+    // Last element should be the "more rows" sentinel.
+    expect(reparsed.changes.rows.length).toBe(21); // 20 rows + sentinel
+    expect(reparsed.changes.rows[20]).toMatch(/more rows/);
+    expect(reparsed.changes.truncated).toBe(true);
+  });
+
+  it('trims overflowing candidate lists to MAX_CANDIDATE_ITEMS with a count summary', () => {
+    // Pad each candidate so the JSON exceeds LLM_OUTPUT_CAP; otherwise we
+    // wouldn't enter the truncation path at all.
+    const candidates = Array.from({ length: 30 }, (_, i) => ({
+      id: `scene-${i.toString().padStart(8, '0')}`,
+      name: `Scene ${i} ` + 'x'.repeat(80),
+      displayName: `Scene ${i} ` + 'x'.repeat(80),
+      genre: 'lofi',
+      key: 'C',
+      lengthBars: 4,
+    }));
+    const envelope = {
+      success: false,
+      action: 'play_scene',
+      error: 'ambiguous_selector',
+      remediation: { type: 'clarification_needed', reason: 'too many', fix: 'pick one' },
+      clarification: { question: 'Which scene?', options: [] },
+      changes: { availableScenes: candidates },
+    };
+    const json = JSON.stringify(envelope);
+    expect(json.length).toBeGreaterThan(4_000);
+    const result = truncateForLLM(json);
+    const reparsed = JSON.parse(result);
+    expect(reparsed.changes.availableScenes.length).toBe(13); // 12 candidates + sentinel
+    expect(reparsed.changes.availableScenes[12]).toMatch(/\+18 more/);
+  });
+
+  it('falls back to head/tail when the JSON does not look like an OperationResult', () => {
+    // Valid JSON but no `success` key — not an envelope. Should head/tail.
+    const arr = JSON.stringify(Array.from({ length: 1000 }, (_, i) => ({ deeply: 'nested', value: i })));
+    expect(arr.length).toBeGreaterThan(4_000);
+    const result = truncateForLLM(arr);
+    expect(result).toMatch(/truncated/);
+    // head + tail format includes the "[... N chars truncated ...]" marker
+    expect(result.split('truncated').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('handles empty and malformed inputs without throwing', () => {
+    expect(truncateForLLM('')).toBe('');
+    expect(truncateForLLM('not json {{{')).toBe('not json {{{');
   });
 });

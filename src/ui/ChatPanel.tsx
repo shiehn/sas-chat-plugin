@@ -40,6 +40,12 @@ export interface ChatPanelProps {
   sendClarificationResponse?: (response: string) => Promise<void>;
   initialEntries?: TerminalEntry[];
   registerReset?: (reset: () => void) => void;
+  /**
+   * Whether the host accordion section is currently expanded. Forwarded
+   * to InputBox so the textarea re-focuses on open. Undefined in
+   * non-accordion hosts (tests, stories) → legacy mount-only focus.
+   */
+  isExpanded?: boolean;
 }
 
 /** Synthetic tool name the agent loop emits when the model calls ask_user. */
@@ -82,6 +88,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   sendClarificationResponse,
   initialEntries = [],
   registerReset,
+  isExpanded,
 }) => {
   const [entries, setEntries] = useState<TerminalEntry[]>(initialEntries);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -295,6 +302,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       <InputBox
         onSend={handleSend}
         disabled={inputDisabled}
+        isExpanded={isExpanded}
         placeholder={
           pendingClarification
             ? 'answer the question above — Enter to send'

@@ -180,12 +180,26 @@ export interface AgentLoopOptions {
   toolExecutor: ToolExecutor;
   /** System instruction text. */
   systemPrompt: string;
-  /** Gemini model id. Default: 'gemini-2.5-flash'. */
+  /** Gemini model id. Default: 'gemini-3.1-pro-preview' — Google's flagship
+   *  agentic-tool-use model (Feb 2026). Leads MCP-Atlas (69.2%) and APEX-Agents
+   *  (33.5%) for multi-MCP tool coordination. Older 2.5-pro is materially
+   *  weaker at recovering from structured tool errors. */
   model?: string;
-  /** Iteration cap. Default: 10. */
+  /** Iteration cap. Default: 25. Older default of 10 frequently exhausted on
+   *  composite intents (compose_scene → tweak → preview); 25 leaves headroom
+   *  for ambient-context recovery + clarification round-trips without going
+   *  unbounded. Per-tool timeouts are the safety net. */
   maxIterations?: number;
   /** Optional event sink for streaming UI updates. */
   onEvent?: AgentLoopEventHandler;
+  /** Optional callback that returns a "you are here" preamble injected into
+   *  systemInstruction at the start of each `run()` call. Equivalent to
+   *  Claude Code injecting `git status` + tree + CLAUDE.md every turn — gives
+   *  the agent ambient project state so it doesn't have to call
+   *  sas_inspect_project before every fuzzy reference. Failures are
+   *  swallowed; the turn proceeds without ambient context. Called once per
+   *  run() (not per iteration). */
+  getAmbientContext?: () => Promise<string>;
 }
 
 export interface AgentLoopResult {
@@ -201,8 +215,8 @@ export interface AgentLoopResult {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MAX_ITERATIONS = 10;
-const DEFAULT_MODEL = 'gemini-2.5-pro';
+const DEFAULT_MAX_ITERATIONS = 25;
+const DEFAULT_MODEL = 'gemini-3.1-pro-preview';
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -211,6 +225,31 @@ const DEFAULT_MODEL = 'gemini-2.5-pro';
 /**
  * Drives a single conversation. One instance per chat session; call
  * `reset()` when switching scenes (chat is scene-scoped).
+ *
+ * Invariant — scene-change during a tool call must NOT corrupt `contents`
+ * (C-8 in `docs/chat-cli-architecture.md`):
+ *
+ *   A tool the agent invokes (most commonly `compose_scene` or any
+ *   `scene_activate`-adjacent flow) can switch the active scene while
+ *   `run()` is still mid-iteration. The chat-plugin's `onSceneChanged`
+ *   handler responds by calling `agent.reset()` to clear the (now-stale)
+ *   conversation history. Without the deferral guards (`isRunning`,
+ *   `pendingReset`), reset() would empty `contents` while iter N+1 still
+ *   expects `[user, model(toolCall)]` in front of the upcoming
+ *   `user(funcResponse)` turn. The result is a single-turn payload the
+ *   Gemini API rejects with HTTP 400 ("function response turn comes
+ *   immediately after a function call turn"), surfaced to the user as a
+ *   confusing failure.
+ *
+ *   The contract this class enforces:
+ *     1. While `isRunning` is true, any external `reset()` is recorded
+ *        as a `pendingReset` and applied in the `finally` of `run()`.
+ *     2. `contents` is only touched by `run()` while `isRunning` is
+ *        true; nothing else may write to it.
+ *     3. Tests covering this race live in `__tests__/agent-loop.test.ts`:
+ *        "defers reset() requests that arrive while a run is in flight"
+ *        (executor-triggered) and "defers reset() requests fired by the
+ *        host-level onSceneChanged path" (integration-style).
  */
 export class AgentLoop {
   private readonly host: PluginHost;
@@ -220,6 +259,11 @@ export class AgentLoop {
   private readonly model: string;
   private readonly maxIterations: number;
   private readonly onEvent?: AgentLoopEventHandler;
+  private readonly getAmbientContext?: () => Promise<string>;
+  /** Ambient context fetched once at the start of each `run()` and reused
+   *  across every iteration of that turn. Cleared between turns so a
+   *  scene-change mid-turn is reflected on the NEXT user message. */
+  private ambientThisTurn = '';
 
   private contents: LLMContent[] = [];
   private callIdCounter = 0;
@@ -243,6 +287,7 @@ export class AgentLoop {
     this.model = options.model ?? DEFAULT_MODEL;
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     this.onEvent = options.onEvent;
+    this.getAmbientContext = options.getAmbientContext;
   }
 
   /** Drop conversation history (called on scene change). Defers if a run is
@@ -300,6 +345,19 @@ export class AgentLoop {
     userMessage: string,
     emit: (event: AgentLoopEvent) => void
   ): Promise<AgentLoopResult> {
+    // Refresh "you are here" context once at the start of the turn. State
+    // changes the agent makes during the turn will surface in tool results;
+    // we don't pay for re-inspection per iteration.
+    this.ambientThisTurn = '';
+    if (this.getAmbientContext) {
+      try {
+        this.ambientThisTurn = (await this.getAmbientContext()) ?? '';
+      } catch {
+        // Inspection failures must never block the turn.
+        this.ambientThisTurn = '';
+      }
+    }
+
     this.contents.push({
       role: 'user',
       parts: [{ text: userMessage }],
@@ -318,12 +376,16 @@ export class AgentLoop {
     while (iteration < this.maxIterations) {
       iteration++;
 
+      const sysText =
+        this.ambientThisTurn.length > 0
+          ? `${this.systemPrompt}\n\n${this.ambientThisTurn}`
+          : this.systemPrompt;
       const request: LLMToolUseRequest = {
         model: this.model,
         // Pass a snapshot — the host (and any captured-by-reference mock or
         // analytics consumer) shouldn't see later mutations.
         contents: [...this.contents],
-        systemInstruction: { parts: [{ text: this.systemPrompt }] },
+        systemInstruction: { parts: [{ text: sysText }] },
         tools: this.tools.length > 0 ? this.tools : undefined,
       };
 
@@ -523,15 +585,133 @@ function hasText(part: LLMPart): part is LLMPart & { text: string } {
 
 /** Cap CLI output fed back to the LLM. Big enough for any reasonable
  *  remediation envelope; small enough that a few turns don't blow the
- *  context budget. Keeps the head + tail so structure (e.g. JSON braces)
- *  remains parseable.
+ *  context budget. For OperationResult-shaped JSON the truncator preserves
+ *  the load-bearing metadata fields (success, error, remediation,
+ *  clarification, nextSteps, suggestion) and only trims bulky `changes`
+ *  payloads (db_query rows, candidate lists). For everything else it falls
+ *  back to head + tail slicing.
+ *
+ *  ⚠️ KEEP IN SYNC with `sas-assistant/src/shared/utils/operation-result-truncate.ts`.
+ *  This is the canonical algorithm; it lives here too because the chat-plugin
+ *  is a sibling repo (git submodule) and can't import directly from
+ *  sas-assistant. If you change either copy, propagate to the other.
+ *  Resolves C-4 in `docs/chat-cli-architecture.md`. A parity test lives in
+ *  the chat-plugin's __tests__ to catch drift.
  */
 const LLM_OUTPUT_CAP = 4_000;
 const LLM_OUTPUT_HEAD = 2_400;
 const LLM_OUTPUT_TAIL = 1_200;
 
+/** Max items to keep verbatim in a candidate list (availableScenes etc.).
+ *  Beyond this we keep the first N + a count summary — enough for the agent
+ *  to call ask_user with a meaningful menu without blowing the budget. */
+const MAX_CANDIDATE_ITEMS = 12;
+/** Max rows to keep verbatim from a db_query result. */
+const MAX_DB_ROWS = 20;
+
+interface OperationResultLike {
+  success?: unknown;
+  changes?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+function looksLikeOperationResult(parsed: unknown): parsed is OperationResultLike {
+  return (
+    typeof parsed === 'object' &&
+    parsed !== null &&
+    !Array.isArray(parsed) &&
+    'success' in (parsed as Record<string, unknown>)
+  );
+}
+
+/** Trim a candidate item to its identifying fields. Drops timestamps, plugin
+ *  parameter blobs, and other bulk that the agent doesn't need to disambiguate. */
+function trimCandidate(item: unknown): unknown {
+  if (typeof item !== 'object' || item === null) return item;
+  const src = item as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of ['id', 'name', 'displayName', 'role', 'genre', 'key', 'lengthBars', 'sceneId', 'engineTrackId']) {
+    if (key in src) out[key] = src[key];
+  }
+  return Object.keys(out).length > 0 ? out : item;
+}
+
+/** Fields inside `changes` whose contents must survive intact. Everything else
+ *  is fair game for summarization when the envelope overflows. */
+const CHANGES_PRESERVE = new Set([
+  'availableScenes', 'availableTracks', 'availableTransitions', 'options',
+  'rows', 'rowCount', 'columns', 'truncated',
+  // Identity / counts that the agent commonly reads:
+  'sceneId', 'trackId', 'transitionId', 'projectId', 'engineTrackId', 'jobId',
+  'count', 'total', 'name', 'displayName', 'role', 'status',
+]);
+
+/** Max length for arbitrary string fields in `changes` before we summarize. */
+const MAX_CHANGES_STRING_LEN = 500;
+
+/** Trim bulky `changes` sub-arrays in place, returning a new shallow copy. */
+function trimChanges(changes: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...changes };
+
+  for (const key of ['availableScenes', 'availableTracks', 'availableTransitions', 'options']) {
+    const v = out[key];
+    if (Array.isArray(v) && v.length > 0) {
+      const trimmed = v.slice(0, MAX_CANDIDATE_ITEMS).map(trimCandidate);
+      out[key] = v.length > MAX_CANDIDATE_ITEMS
+        ? [...trimmed, `[+${v.length - MAX_CANDIDATE_ITEMS} more — call db_query or sas_inspect_project for the full list]`]
+        : trimmed;
+    }
+  }
+
+  if (Array.isArray(out.rows) && (out.rows as unknown[]).length > MAX_DB_ROWS) {
+    const rows = out.rows as unknown[];
+    out.rows = [...rows.slice(0, MAX_DB_ROWS), `[+${rows.length - MAX_DB_ROWS} more rows — add LIMIT or refine the WHERE clause]`];
+    out.truncated = true;
+  }
+
+  // Any other long string in `changes` (debug blobs, base64 audio metadata,
+  // verbose snapshots) gets summarized so it can't crowd out the envelope.
+  for (const key of Object.keys(out)) {
+    if (CHANGES_PRESERVE.has(key)) continue;
+    const v = out[key];
+    if (typeof v === 'string' && v.length > MAX_CHANGES_STRING_LEN) {
+      out[key] = `[${v.length} chars omitted from changes.${key} — call the relevant inspect_* tool if you need it]`;
+    }
+  }
+
+  return out;
+}
+
 export function truncateForLLM(s: string): string {
+  if (typeof s !== 'string') return s;
   if (s.length <= LLM_OUTPUT_CAP) return s;
+
+  // Try envelope-aware path first. If the payload is an OperationResult
+  // we preserve clarification + remediation in full and only trim bulky
+  // candidate / row arrays. This stops the agent from seeing "I'm
+  // ambiguous" without the actual options to feed ask_user.
+  try {
+    const parsed: unknown = JSON.parse(s);
+    if (looksLikeOperationResult(parsed)) {
+      const trimmed: OperationResultLike = { ...parsed };
+      if (trimmed.changes && typeof trimmed.changes === 'object' && !Array.isArray(trimmed.changes)) {
+        trimmed.changes = trimChanges(trimmed.changes as Record<string, unknown>);
+      }
+      const re = JSON.stringify(trimmed);
+      if (re.length <= LLM_OUTPUT_CAP) return re;
+      // Still too big after trimming candidates — fall through to head/tail
+      // on the re-serialized form, which at least keeps clarification intact
+      // if it fits in the head.
+      return headTail(re);
+    }
+  } catch {
+    // not JSON, fall through
+  }
+
+  return headTail(s);
+}
+
+function headTail(s: string): string {
   const head = s.slice(0, LLM_OUTPUT_HEAD);
   const tail = s.slice(-LLM_OUTPUT_TAIL);
   const omitted = s.length - head.length - tail.length;

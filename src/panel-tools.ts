@@ -420,3 +420,210 @@ function injectActiveSceneId(
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
+
+// ---------------------------------------------------------------------------
+// Ambient context — "you are here" preamble auto-refreshed each turn.
+// ---------------------------------------------------------------------------
+
+/** Cap the preamble at ~2KB so it doesn't crowd out tool descriptions or
+ *  conversation history in the model's context budget. */
+const AMBIENT_CONTEXT_CAP = 2_000;
+const AMBIENT_MAX_SCENES = 12;
+const AMBIENT_MAX_TRACKS = 16;
+const AMBIENT_MAX_HISTORY = 3;
+
+/** Bound the ambient cache by recency, not by mutation seq (the host SDK
+ *  doesn't expose one yet). Short enough that a tool mutation followed by a
+ *  user message still pulls fresh state; long enough that a burst of agent
+ *  turns within seconds doesn't repeatedly re-inspect the project. Resolves
+ *  C-5 in `docs/chat-cli-architecture.md`. */
+const AMBIENT_CACHE_TTL_MS = 5_000;
+
+interface AmbientCacheEntry {
+  /** Active scene id at compute time. Cache invalidates immediately when this changes. */
+  activeSceneId: string | null;
+  /** Wallclock ms of compute. Cache expires after AMBIENT_CACHE_TTL_MS. */
+  ts: number;
+  /** The rendered preamble string. */
+  ambient: string;
+}
+
+/**
+ * Per-host ambient cache. WeakMap so a discarded host doesn't pin the
+ * cache entry. Keyed by the PluginHost identity — each plugin instance
+ * gets its own slot.
+ */
+const ambientCache = new WeakMap<PluginHost, AmbientCacheEntry>();
+
+/**
+ * Force-invalidate the cache for a host. Tests use this; production code
+ * doesn't need to call it (the active-scene-id check + TTL handle drift).
+ */
+export function _resetAmbientCacheForTests(host: PluginHost): void {
+  ambientCache.delete(host);
+}
+
+interface AmbientScene {
+  id?: string;
+  name?: string;
+  displayName?: string;
+}
+interface AmbientTrack {
+  id?: string;
+  sceneId?: string;
+  name?: string;
+  displayName?: string;
+  role?: string;
+}
+interface AmbientHistory {
+  action?: string;
+  description?: string;
+  timestamp?: string;
+}
+
+/** Format a short, agent-legible "you are here" preamble describing the
+ *  current project, active scene, scene list, track roles in the active scene,
+ *  and recent history. Designed to be appended to the system prompt at the
+ *  start of each turn so the agent doesn't need to call sas_inspect_project
+ *  before every fuzzy reference.
+ *
+ *  Entirely defensive: if executeAppTool fails (no project bound, host
+ *  shutdown mid-turn, etc.), returns an empty string. The caller should treat
+ *  empty as "skip injection, continue the turn".
+ *
+ *  Equivalent to Claude Code injecting `git status` + tree + CLAUDE.md every
+ *  turn — cheap recurring context beats expensive recovery via tool calls. */
+export async function buildAmbientContext(host: PluginHost): Promise<string> {
+  // Cache fast-path. The same active scene with a recent compute returns
+  // the cached preamble — most chat turns happen within seconds of each
+  // other and the broad project structure doesn't change between them.
+  // Active-scene changes blow the cache immediately; the TTL covers
+  // other-state changes (tracks/history) at coarse granularity.
+  const activeSceneIdFromHost = host.getActiveSceneId() ?? null;
+  const cached = ambientCache.get(host);
+  if (
+    cached &&
+    cached.activeSceneId === activeSceneIdFromHost &&
+    Date.now() - cached.ts < AMBIENT_CACHE_TTL_MS
+  ) {
+    return cached.ambient;
+  }
+
+  try {
+    const result = await host.executeAppTool('sas_inspect_project', {
+      include: ['scenes', 'tracks', 'history'],
+    });
+    if (!result.success) return '';
+    // executeAppTool wraps the OperationResult in `data` (see
+    // PluginHostImpl.executeAppTool — `{ success, action, message, error,
+    // data: result }`). The OperationResult itself carries `changes`.
+    const opResult = isRecord(result.data) ? result.data : null;
+    if (!opResult || !isRecord(opResult.changes)) return '';
+    const changes = opResult.changes;
+    const project = isRecord(changes.project) ? changes.project : null;
+    const scenes: AmbientScene[] = Array.isArray(changes.scenes)
+      ? (changes.scenes as AmbientScene[])
+      : [];
+    const tracks: AmbientTrack[] = Array.isArray(changes.tracks)
+      ? (changes.tracks as AmbientTrack[])
+      : [];
+    const history: AmbientHistory[] = Array.isArray(changes.history)
+      ? (changes.history as AmbientHistory[])
+      : [];
+
+    const lines: string[] = ['=== Current state (auto-refreshed each turn) ==='];
+
+    // Project block: full id, surfaced as a bind-param hint so the agent
+    // knows EXACTLY where to use it (db_query AND project_id = ?).
+    if (project && typeof project.name === 'string') {
+      lines.push(`Project name: "${project.name}"`);
+    }
+    if (project && typeof project.id === 'string') {
+      lines.push(
+        `Project id  : ${project.id}   (use as \`project_id = ?\` bind param in db_query)`,
+      );
+    }
+
+    // Active scene block: same prominence + usage hint. The user switches
+    // scenes a lot; per-turn refresh keeps this fresh.
+    const activeSceneId =
+      project && typeof project.activeSceneId === 'string'
+        ? project.activeSceneId
+        : host.getActiveSceneId();
+    const activeScene = scenes.find((s) => s.id === activeSceneId);
+    if (activeScene) {
+      const name = activeScene.displayName ?? activeScene.name ?? '(unnamed)';
+      lines.push(`Active scene name: "${name}"`);
+    }
+    if (typeof activeSceneId === 'string') {
+      lines.push(
+        `Active scene id  : ${activeSceneId}   (use as \`scene_id = ?\` in db_query; auto-injected into scene-scoped tools)`,
+      );
+    }
+
+    // Scene listing as an explicit name→id mapping table. The previous
+    // inline `[id-prefix]` format lured Gemini into passing the id AS a
+    // sceneName argument; the arrow format keeps name and id structurally
+    // distinct so the model can't confuse them.
+    if (scenes.length > 0) {
+      const visible = scenes.slice(0, AMBIENT_MAX_SCENES);
+      lines.push(
+        `Scenes (${scenes.length}) — pass scene_name when calling play_scene; scene_id only for db_query:`,
+      );
+      for (const s of visible) {
+        const name = s.displayName ?? s.name ?? '(unnamed)';
+        const idStr = typeof s.id === 'string' ? s.id : '<unknown>';
+        lines.push(`  - "${name}"  →  id = ${idStr}`);
+      }
+      if (scenes.length > AMBIENT_MAX_SCENES) {
+        lines.push(`  - (+${scenes.length - AMBIENT_MAX_SCENES} more — call sas_inspect_project for the full list)`);
+      }
+    }
+
+    if (activeSceneId) {
+      const sceneTracks = tracks.filter((t) => t.sceneId === activeSceneId);
+      if (sceneTracks.length > 0) {
+        const visible = sceneTracks.slice(0, AMBIENT_MAX_TRACKS);
+        lines.push(`Tracks in active scene (${sceneTracks.length}):`);
+        for (const t of visible) {
+          const name = t.displayName ?? t.name ?? '(unnamed)';
+          const roleSuffix = t.role ? ` — role: ${t.role}` : '';
+          lines.push(`  - "${name}"${roleSuffix}`);
+        }
+        if (sceneTracks.length > AMBIENT_MAX_TRACKS) {
+          lines.push(`  - (+${sceneTracks.length - AMBIENT_MAX_TRACKS} more)`);
+        }
+      }
+    }
+
+    if (history.length > 0) {
+      const recent = history
+        .slice(0, AMBIENT_MAX_HISTORY)
+        .map((h) => h.action ?? h.description ?? '?')
+        .join(' → ');
+      lines.push(`Recent actions: ${recent}`);
+    }
+
+    lines.push('=== End current state ===');
+
+    const joined = lines.join('\n');
+    const ambient =
+      joined.length <= AMBIENT_CONTEXT_CAP
+        ? joined
+        : (() => {
+            const suffix = '\n[truncated]\n=== End ===';
+            return joined.slice(0, AMBIENT_CONTEXT_CAP - suffix.length) + suffix;
+          })();
+
+    ambientCache.set(host, {
+      activeSceneId: activeSceneIdFromHost,
+      ts: Date.now(),
+      ambient,
+    });
+    return ambient;
+  } catch {
+    // Don't poison the cache on transient failure — let the next call try
+    // again. Empty string signals "skip preamble injection".
+    return '';
+  }
+}

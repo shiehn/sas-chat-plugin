@@ -70,4 +70,47 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     // And the discovery hint so the agent knows it can fetch them.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/fs_read_file/);
   });
+
+  it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {
+    // The agent has historically fumbled ambiguous selectors; the prompt
+    // must spell out the contract: when a tool returns clarification_needed,
+    // the response carries the candidate list and the agent should pipe it
+    // straight into ask_user.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/clarification_needed/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/ask_user/);
+    // The candidate-list keys the agent should reach for.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/availableScenes/);
+  });
+
+  it('teaches the not_found recovery path (do not retry same wrong selector)', () => {
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/track_not_found|scene_not_found|transition_not_found/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_inspect_project/);
+  });
+
+  it('promotes db_query as the agent\'s state-question escape hatch', () => {
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/db_query/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/db_describe_schema/);
+    // The DB-scoping rule (cross-project leakage protection).
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/project_id/);
+  });
+
+  it('makes "inspect first on fuzzy reference" explicit in the work loop', () => {
+    // The "inspect first" line specifically calls out the
+    // entity-by-name pattern that historically failed without inspection.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_inspect_project/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Don't guess/i);
+  });
+
+  it('teaches transient-failure retry via the STRUCTURAL retryable signal (no hardcoded phrase list)', () => {
+    // The earlier version of this test asserted on hardcoded phrases like
+    // "in flight" / "loading" — those were a heuristic the user explicitly
+    // rejected. The replacement: the prompt teaches the agent to read the
+    // STRUCTURAL `remediation.retryable === true` flag set by tools whose
+    // failures are inherently transient.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/remediation\.retryable/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/retry/i);
+    // Regression guard: the hardcoded phrase list must NOT come back.
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/"in flight"/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/"warming up"/);
+  });
 });

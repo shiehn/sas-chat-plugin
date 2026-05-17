@@ -6,7 +6,7 @@
  * spawning a subprocess.
  */
 
-import { ASK_USER_TOOL_NAME, buildPanelTools, extractNextSteps } from '../panel-tools';
+import { ASK_USER_TOOL_NAME, buildAmbientContext, buildPanelTools, extractNextSteps } from '../panel-tools';
 import * as toolHandler from '../sas-tool-handler';
 import type { PluginAppTool } from '@signalsandsorcery/plugin-sdk';
 
@@ -872,5 +872,166 @@ describe('extractNextSteps', () => {
       { description: 'b' },
       { description: 'c', mcp: { tool: 'c', args: { ok: true } } },
     ]);
+  });
+});
+
+describe('buildAmbientContext', () => {
+  /**
+   * `executeAppTool` returns a PluginAppToolResult whose `data` field is the
+   * underlying OperationResult (with `changes`). The tests describe the
+   * OperationResult shape directly via `inspectInner` and we wrap it here so
+   * they read like the real on-the-wire payload.
+   */
+  function makeAmbientHost(opts: {
+    inspectInner?: { success: boolean; changes?: unknown; error?: string };
+    inspectThrows?: Error;
+    activeSceneId?: string | null;
+  } = {}) {
+    const inner = opts.inspectInner ?? { success: true, changes: {} };
+    return {
+      executeAppTool: jest.fn(async () => {
+        if (opts.inspectThrows) throw opts.inspectThrows;
+        return {
+          success: inner.success,
+          action: 'sas_inspect_project',
+          message: 'ok',
+          error: inner.error,
+          data: { ...inner, action: 'sas_inspect_project' },
+        };
+      }),
+      getActiveSceneId: jest.fn(() => opts.activeSceneId ?? null),
+    };
+  }
+
+  it('formats project, active scene, scene list, and tracks-in-active-scene', async () => {
+    const host = makeAmbientHost({
+      inspectInner: {
+        success: true,
+        changes: {
+          project: { id: 'proj-12345678-aaaa-bbbb-cccc-dddddddddddd', name: 'Demo', activeSceneId: 'scene-aaaa1111-2222-3333-4444-555555555555' },
+          scenes: [
+            { id: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Verse 1', displayName: 'Verse 1' },
+            { id: 'scene-bbbb2222-2222-3333-4444-555555555555', name: 'Chorus', displayName: 'Chorus' },
+          ],
+          tracks: [
+            { id: 't1', sceneId: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Drums', role: 'drums' },
+            { id: 't2', sceneId: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Bass', role: 'bass' },
+            { id: 't3', sceneId: 'scene-bbbb2222-2222-3333-4444-555555555555', name: 'Pad', role: 'pads' }, // different scene
+          ],
+        },
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const text = await buildAmbientContext(host as any);
+
+    // Project block: full id + bind-param hint, not just an 8-char prefix.
+    expect(text).toContain('Project name: "Demo"');
+    expect(text).toContain('Project id  : proj-12345678-aaaa-bbbb-cccc-dddddddddddd');
+    expect(text).toMatch(/project_id = \?/);
+
+    // Active scene block: full id + usage hint.
+    expect(text).toContain('Active scene name: "Verse 1"');
+    expect(text).toContain('Active scene id  : scene-aaaa1111-2222-3333-4444-555555555555');
+    expect(text).toMatch(/scene_id = \?/);
+
+    // Scene listing uses the arrow format (name → id), no bracketed prefix.
+    expect(text).toMatch(/"Verse 1"\s+→\s+id = scene-aaaa1111-2222-3333-4444-555555555555/);
+    expect(text).toMatch(/"Chorus"\s+→\s+id = scene-bbbb2222-2222-3333-4444-555555555555/);
+
+    // Active-scene track listing only includes tracks for that scene
+    expect(text).toMatch(/Tracks in active scene \(2\):/);
+    expect(text).toMatch(/"Drums" — role: drums/);
+    expect(text).toMatch(/"Bass" — role: bass/);
+    expect(text).not.toContain('Pad'); // belongs to a different scene
+  });
+
+  it('uses NO bracketed UUID-prefix on scene names (regression guard for the [fdee5834] confusion)', async () => {
+    // Pre-fix the scene listing was `"techno" [fdee5834]` and Gemini tried to
+    // pass that bracketed value AS a sceneName argument. The new format must
+    // structurally separate name from id with the arrow notation.
+    const host = makeAmbientHost({
+      inspectInner: {
+        success: true,
+        changes: {
+          project: { id: 'proj-x', name: 'p', activeSceneId: null },
+          scenes: [
+            { id: 'fdee5834-d206-4ba6-96e4-c65d93e52419', name: 'techno', displayName: 'techno' },
+          ],
+          tracks: [],
+        },
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const text = await buildAmbientContext(host as any);
+    // The bracketed-prefix format is a regression source — assert NEVER present.
+    expect(text).not.toMatch(/"techno"\s+\[/);
+    expect(text).not.toMatch(/\[fdee5834\]/);
+    // The arrow-form replacement must be present.
+    expect(text).toMatch(/"techno"\s+→\s+id = fdee5834-d206-4ba6-96e4-c65d93e52419/);
+  });
+
+  it('returns empty string when executeAppTool fails (never blocks the turn)', async () => {
+    const host = makeAmbientHost({ inspectThrows: new Error('no project bound') });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const text = await buildAmbientContext(host as any);
+    expect(text).toBe('');
+  });
+
+  it('returns empty string when the inspect result is unsuccessful', async () => {
+    const host = makeAmbientHost({
+      inspectInner: { success: false, error: 'no project', changes: {} },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const text = await buildAmbientContext(host as any);
+    expect(text).toBe('');
+  });
+
+  it('caps the preamble at ~2KB even with many scenes/tracks', async () => {
+    const scenes = Array.from({ length: 50 }, (_, i) => ({
+      id: `scene-${i.toString().padStart(8, '0')}`,
+      name: `Scene ${i}`,
+      displayName: `Scene ${i} ` + 'x'.repeat(50),
+    }));
+    const tracks = Array.from({ length: 100 }, (_, i) => ({
+      id: `t-${i}`,
+      sceneId: 'scene-00000000',
+      name: `Track ${i} ` + 'y'.repeat(40),
+      role: 'bass',
+    }));
+    const host = makeAmbientHost({
+      inspectInner: {
+        success: true,
+        changes: {
+          project: { id: 'proj-12345678', name: 'Big', activeSceneId: 'scene-00000000' },
+          scenes,
+          tracks,
+        },
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const text = await buildAmbientContext(host as any);
+    expect(text.length).toBeLessThanOrEqual(2_000);
+    expect(text).toContain('+'); // truncation indicator from "+N more" hint
+  });
+
+  it('handles missing activeSceneId gracefully (no Active scene line)', async () => {
+    const host = makeAmbientHost({
+      inspectInner: {
+        success: true,
+        changes: {
+          project: { id: 'proj-12345678', name: 'Demo', activeSceneId: null },
+          scenes: [{ id: 'scene-x', name: 'Lone', displayName: 'Lone' }],
+          tracks: [],
+        },
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const text = await buildAmbientContext(host as any);
+    expect(text).toContain('Project name: "Demo"');
+    expect(text).toContain('"Lone"');
+    expect(text).not.toContain('Active scene name:');
+    expect(text).not.toContain('Active scene id  :');
   });
 });

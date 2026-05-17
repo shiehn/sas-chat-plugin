@@ -15,6 +15,14 @@ export interface InputBoxProps {
   disabled?: boolean;
   placeholder?: string;
   autoFocus?: boolean;
+  /**
+   * When provided, the textarea re-focuses every time this flips to `true`
+   * (and again whenever `disabled` flips back to `false` while expanded).
+   * Lets the host accordion section drive focus on open without coupling
+   * InputBox to the accordion DOM. Undefined = legacy behavior (mount-only
+   * autoFocus).
+   */
+  isExpanded?: boolean;
 }
 
 const DEFAULT_PLACEHOLDER = 'ask anything — Enter to send, Shift+Enter for newline';
@@ -26,6 +34,7 @@ export const InputBox: React.FC<InputBoxProps> = ({
   disabled = false,
   placeholder = DEFAULT_PLACEHOLDER,
   autoFocus = true,
+  isExpanded,
 }) => {
   const [text, setText] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -38,6 +47,12 @@ export const InputBox: React.FC<InputBoxProps> = ({
     // current focus target and breaks the `autoFocus={false}` contract.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!isExpanded) return;
+    if (disabled) return;
+    textareaRef.current?.focus();
+  }, [isExpanded, disabled]);
 
   const handleSend = useCallback((): void => {
     if (disabled) return;

@@ -46,12 +46,17 @@ import { ChatPanel } from './ui/ChatPanel';
 async function loadHostDeps(): Promise<{
   AgentLoop: typeof import('./agent-loop').AgentLoop;
   buildPanelTools: typeof import('./panel-tools').buildPanelTools;
+  buildAmbientContext: typeof import('./panel-tools').buildAmbientContext;
 }> {
-  const [{ AgentLoop }, { buildPanelTools }] = await Promise.all([
+  const [{ AgentLoop }, panelToolsModule] = await Promise.all([
     import('./agent-loop'),
     import('./panel-tools'),
   ]);
-  return { AgentLoop, buildPanelTools };
+  return {
+    AgentLoop,
+    buildPanelTools: panelToolsModule.buildPanelTools,
+    buildAmbientContext: panelToolsModule.buildAmbientContext,
+  };
 }
 
 export const CHAT_PANEL_PLUGIN_ID = '@signalsandsorcery/chat-panel';
@@ -116,12 +121,12 @@ What S&S is, at a domain level (use this vocabulary when the user asks "what is 
 For implementation-detail questions (engine internals, database schema, rendering pipeline, plugin SDK), design docs live at \`sas-assistant/docs/*.md\` on disk. Notable: \`docs/transition-generator.md\` (six-stage pipeline, chord notation rules, atomic commit, orphan cleanup). The top-level \`CLAUDE.md\` and \`sas-assistant/CLAUDE.md\` document the engineering rules (DB scoping, role taxonomy, deck playback rules, etc.). Use \`fs_read_file\` (find it via \`tool_search\`; user approves each read) to fetch one when the user asks something deeper than the vocabulary above can answer, and cite the file you read in your reply.
 
 How to work:
-- Inspect first. If you don't know what's in the active scene, call a discovery tool (e.g. scene_get_tracks).
+- Inspect first. If the user references an entity by name ("the bass scene", "Verse 1", "the loud track") and you don't already see its exact ID in the auto-injected "Current state" preamble or working memory, call \`sas_inspect_project\` ONCE up-front to load the candidate list — THEN attempt the action with the resolved ID. Don't guess.
 - When the user refers to a track by role ("the bass"), match it to the actual track list.
-- Read tool errors carefully — the CLI returns structured remediation in stderr.
+- Read tool errors carefully — the CLI returns structured remediation in stderr (see "Recovering from clarification" below for the contract).
 - Tools may declare a sceneId parameter — the host injects the active scene automatically; you don't have to pass it.
 - Be concise. The user can hear the result; explanations are for when something needs explaining.
-- Your default tool list is scene-scoped. For project-wide actions (deck control "play loop-a / loop-b", audio routing, project switching, transitions, history/undo, audio export), call \`tool_search\` with a keyword query FIRST — most capabilities not on your default list are reachable that way, then invoke the returned tool by name.
+- Your default tool list is scene-scoped. For project-wide actions (deck control "play loop-a / loop-b", audio routing, project switching, transitions, history/undo, audio export), call \`tool_search\` with a keyword query FIRST — most capabilities not on your default list are reachable that way, then invoke the returned tool by name. You do NOT need to ask the user before invoking a tool you found via tool_search; just call it.
 
 Answering arbitrary state questions ("how many AI tracks in scene X", "which track has the most plugins", "is the system performing well"):
 - \`db_query\` runs a read-only SELECT / WITH / PRAGMA against the app's SQLite database and returns rows. Pair it with \`db_describe_schema\` (the "ls" of the DB) the first time you touch an unfamiliar table.
@@ -136,6 +141,16 @@ When to ask vs proceed:
 - When you do ask, keep the question focused (one sentence) and pass an \`options\` array of 2–4 candidates whenever you can enumerate them — the UI renders quick-reply buttons.
 - Do not ask to confirm tool calls you've already decided to make. Do not ask "are you sure?" — destructive operations are reversible.
 - If a request is out of scope, say so plainly and suggest what the user could do instead. Don't use \`ask_user\` for scope rejection.
+
+Recovering from clarification (this is a contract — follow it):
+- When ANY tool returns \`remediation.type === 'clarification_needed'\`, the response ALSO carries \`clarification.question\` and \`clarification.options[]\` (or \`changes.availableScenes[]\` / \`changes.availableTracks[]\` / \`changes.availableTransitions[]\`). DO NOT guess and DO NOT retry the same call. Call \`ask_user\` immediately with the question text and an \`options\` array built from those candidates (use their \`label\` / \`displayName\` / \`name\`). When the user picks, retry the original tool with the corresponding \`id\`.
+- When a tool returns \`remediation.type === 'track_not_found'\` / \`'scene_not_found'\` / \`'transition_not_found'\`, the user's selector resolved to nothing. Either ask the user to clarify or call \`sas_inspect_project\` to enumerate what DOES exist — do NOT keep retrying with variations of the same wrong selector.
+- When a tool returns \`remediation.prerequisiteChain\`, run the named prerequisite tools in order before retrying. Each chain entry includes the action name and (often) a CLI hint.
+
+Transient failures (structural signal — do NOT pattern-match error strings):
+- Some failures are transient: the system is busy, not broken. Tools that wrap inherently-racy operations (track loads, engine readiness, graph prep) signal this STRUCTURALLY by setting \`remediation.retryable === true\` on the failure response.
+- When you see \`remediation.retryable === true\`, retry the SAME call ONCE before reporting to the user. If the second call also fails, THEN report and stop. Do not loop.
+- This is the ONLY signal you should use to decide retry-on-transient. Do not infer transient-ness from error message wording — the structural flag is the contract.
 
 Don't give up without making a call:
 - If your default tool list doesn't have an exact match, your FIRST move is \`tool_search\` with a keyword from the user's ask (deck, transition, audio, route, project, export, history, …) — NOT a text reply saying "I can't do that".
@@ -170,7 +185,7 @@ function getBridge(): ChatPluginRendererBridge | null {
   return api?.chatPlugin ?? null;
 }
 
-const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId }) => {
+const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }) => {
   const bridgeRef = useRef<ChatPluginRendererBridge | null>(null);
   const [bridgeAvailable, setBridgeAvailable] = useState<boolean>(true);
 
@@ -228,6 +243,7 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId }) => {
   return React.createElement(ChatPanel, {
     sendMessage,
     sendClarificationResponse,
+    isExpanded,
   });
 };
 
@@ -267,7 +283,7 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     // (e.g., test env, or app not fully booted), defer until first chat().
     const cliPaths = host.getCliPaths();
     if (cliPaths) {
-      const { AgentLoop, buildPanelTools } = await loadHostDeps();
+      const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
       this.panelTools = await buildPanelTools({
         host,
         cliPaths,
@@ -278,6 +294,7 @@ export class ChatPanelPlugin implements GeneratorPlugin {
         tools: this.panelTools.tools,
         toolExecutor: this.panelTools.executor,
         systemPrompt: DEFAULT_SYSTEM_PROMPT,
+        getAmbientContext: () => buildAmbientContext(host),
       });
     }
   }
@@ -301,17 +318,19 @@ export class ChatPanelPlugin implements GeneratorPlugin {
           'Make sure the plugin runs in the main process and `npm run build:cli` has produced dist/cli/sas.js.'
       );
     }
-    const { AgentLoop, buildPanelTools } = await loadHostDeps();
+    const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
+    const host = this.host;
     this.panelTools = await buildPanelTools({
-      host: this.host,
+      host,
       cliPaths,
       awaitUserResponse: this.awaitClarification,
     });
     this.agent = new AgentLoop({
-      host: this.host,
+      host,
       tools: this.panelTools.tools,
       toolExecutor: this.panelTools.executor,
       systemPrompt: DEFAULT_SYSTEM_PROMPT,
+      getAmbientContext: () => buildAmbientContext(host),
     });
     return this.agent;
   }
@@ -367,9 +386,10 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     if (this.host) {
       const cliPaths = this.host.getCliPaths();
       if (!cliPaths) return;
-      const { AgentLoop, buildPanelTools } = await loadHostDeps();
+      const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
+      const host = this.host;
       this.panelTools = await buildPanelTools({
-        host: this.host,
+        host,
         cliPaths,
         awaitUserResponse: this.awaitClarification,
       });
@@ -377,10 +397,11 @@ export class ChatPanelPlugin implements GeneratorPlugin {
         // Construct a fresh loop with the new tools/executor; previous loop
         // is GC'd once references drop. The system prompt is unchanged.
         this.agent = new AgentLoop({
-          host: this.host,
+          host,
           tools: this.panelTools.tools,
           toolExecutor: this.panelTools.executor,
           systemPrompt: DEFAULT_SYSTEM_PROMPT,
+          getAmbientContext: () => buildAmbientContext(host),
         });
       }
     }
