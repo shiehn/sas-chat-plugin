@@ -136,8 +136,8 @@ Subprocess invocation uses the same `electronExe + ELECTRON_RUN_AS_NODE=1 + cliE
 - **[Signals & Sorcery](https://signalsandsorcery.com)** — the flagship AI music production workstation
 - **[sas-plugin-sdk](https://github.com/shiehn/sas-plugin-sdk)** — TypeScript SDK for building generator plugins
 - **[sas-synth-plugin](https://github.com/shiehn/sas-synth-plugin)** — AI MIDI generation with Surge XT
-- **[sas-sample-plugin](https://github.com/shiehn/sas-sample-plugin)** — Sample library browser with time-stretching
-- **[sas-audio-plugin](https://github.com/shiehn/sas-audio-plugin)** — AI audio texture generation
+- **[sas-loops-plugin](https://github.com/shiehn/sas-loops-plugin)** — Audio loop / sample library browser with time-stretching
+- **[sas-stems-plugin](https://github.com/shiehn/sas-stems-plugin)** — AI audio-from-text generation with stem splitting
 - **[sas-recorder-plugin](https://github.com/shiehn/sas-recorder-plugin)** — Loop-aware microphone recording
 - **[DeclarAgent](https://github.com/shiehn/DeclarAgent)** — Declarative agent + MCP transport for S&S
 

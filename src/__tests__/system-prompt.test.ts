@@ -51,11 +51,22 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/vocals/);
   });
 
-  it('defines Plugin and names the three built-in plugins', () => {
+  it('defines Plugin and names the built-in plugins', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Plugin:/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/synth-generator/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sample-player/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/audio-texture/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/drum-generator/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/instrument-generator/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/loops/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/stems/);
+  });
+
+  it('routes sample-based generation vs Surge generation', () => {
+    // The agent must know the sample-based skills exist and when to prefer
+    // them over the Surge dsl_generate_* tools.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/generate_drums/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/generate_instrument/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/dsl_generate_drums/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/dsl_generate_midi/);
   });
 
   it('defines Playback mode (performance vs solo)', () => {
