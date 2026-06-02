@@ -117,7 +117,8 @@ describe('buildPanelTools', () => {
 
     expect(host.listAppTools).toHaveBeenCalledWith({ scope: 'scene' });
     expect(result.tools).toHaveLength(1); // one LLMTool wrapping all decls
-    expect(result.tools[0].functionDeclarations).toHaveLength(2);
+    // 2 scene tools + 2 promoted journal tools + the chat_task_ledger synthetic.
+    expect(result.tools[0].functionDeclarations).toHaveLength(5);
     expect(result.tools[0].functionDeclarations[0]).toEqual(
       expect.objectContaining({
         name: 'scene_get_tracks',
@@ -131,7 +132,7 @@ describe('buildPanelTools', () => {
     );
   });
 
-  it('returns an empty tools array when no tools are discovered', async () => {
+  it('always offers the synthetic memory + ledger tools even when no app tools are discovered', async () => {
     const host = makeHost();
     host.listAppTools.mockResolvedValueOnce([]);
 
@@ -141,7 +142,15 @@ describe('buildPanelTools', () => {
       cliPaths: CLI_PATHS,
     });
 
-    expect(result.tools).toEqual([]);
+    // No app tools, but cross-session memory + the session ledger are
+    // plugin-local and always surfaced.
+    expect(result.tools).toHaveLength(1);
+    const names = result.tools[0].functionDeclarations.map((d) => d.name);
+    expect(names).toEqual([
+      'sas_project_notes_read',
+      'sas_project_notes_write',
+      'chat_task_ledger',
+    ]);
   });
 
   it('executor invokes sas CLI with the bare-KV params', async () => {
@@ -875,6 +884,94 @@ describe('extractNextSteps', () => {
   });
 });
 
+describe('chat_task_ledger (synthetic) + journal surfacing', () => {
+  function makeLedgerHost() {
+    const store = new Map<string, unknown>();
+    return {
+      store,
+      host: {
+        listAppTools: jest.fn().mockResolvedValue(SCENE_TOOLS),
+        getActiveSceneId: jest.fn().mockReturnValue('scene-uuid-123'),
+        getProjectData: jest.fn(async (key: string) => store.get(key) ?? null),
+        setProjectData: jest.fn(async (key: string, value: unknown) => {
+          store.set(key, value);
+        }),
+        getMutationSeq: jest.fn(() => 1),
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mockInvokeSas.mockReset();
+    mockInvokeSas.mockResolvedValue({ success: true, exitCode: 0, stdout: '{}', stderr: '' });
+  });
+
+  it('surfaces the journal + ledger tools by name on the default surface', async () => {
+    const host = makeHost();
+    const { tools } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+    const names = tools[0].functionDeclarations.map((d) => d.name);
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'scene_get_tracks',
+        'sas_project_notes_read',
+        'sas_project_notes_write',
+        'chat_task_ledger',
+      ]),
+    );
+  });
+
+  it('set_goals stores todos, update flips status, clear empties — all without the CLI', async () => {
+    const { host, store } = makeLedgerHost();
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+
+    const r1 = await executor('chat_task_ledger', {
+      op: 'set_goals',
+      goals: ['Make drums punchier', 'Add a riser'],
+    });
+    expect(r1.success).toBe(true);
+    expect(store.get('chat.taskLedger')).toEqual([
+      { text: 'Make drums punchier', status: 'todo' },
+      { text: 'Add a riser', status: 'todo' },
+    ]);
+    expect(mockInvokeSas).not.toHaveBeenCalled(); // synthetic — never spawns the CLI
+
+    const r2 = await executor('chat_task_ledger', { op: 'update', index: 1, status: 'in_progress' });
+    expect(r2.success).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((store.get('chat.taskLedger') as any)[0].status).toBe('in_progress');
+
+    const r3 = await executor('chat_task_ledger', { op: 'clear' });
+    expect(r3.success).toBe(true);
+    expect(store.get('chat.taskLedger')).toEqual([]);
+  });
+
+  it('update rejects an out-of-range index; unknown ops fail cleanly', async () => {
+    const { host } = makeLedgerHost();
+    const { executor } = await buildPanelTools({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      cliPaths: CLI_PATHS,
+    });
+    await executor('chat_task_ledger', { op: 'set_goals', goals: ['only one'] });
+
+    const oob = await executor('chat_task_ledger', { op: 'update', index: 5, status: 'done' });
+    expect(oob.success).toBe(false);
+    expect(oob.stderr).toContain('out of range');
+
+    const bad = await executor('chat_task_ledger', { op: 'frobnicate' });
+    expect(bad.success).toBe(false);
+    expect(bad.stderr).toContain('unknown op');
+  });
+});
+
 describe('buildAmbientContext', () => {
   /**
    * `executeAppTool` returns a PluginAppToolResult whose `data` field is the
@@ -909,13 +1006,14 @@ describe('buildAmbientContext', () => {
         success: true,
         changes: {
           project: { id: 'proj-12345678-aaaa-bbbb-cccc-dddddddddddd', name: 'Demo', activeSceneId: 'scene-aaaa1111-2222-3333-4444-555555555555' },
+          musical_context: { key: 'A minor', bpm: 120, chord_progression: 'Am - F - C - G' },
           scenes: [
             { id: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Verse 1', displayName: 'Verse 1' },
             { id: 'scene-bbbb2222-2222-3333-4444-555555555555', name: 'Chorus', displayName: 'Chorus' },
           ],
           tracks: [
-            { id: 't1', sceneId: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Drums', role: 'drums' },
-            { id: 't2', sceneId: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Bass', role: 'bass' },
+            { id: 't1', sceneId: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Drums', role: 'drums', solo: true },
+            { id: 't2', sceneId: 'scene-aaaa1111-2222-3333-4444-555555555555', name: 'Bass', role: 'bass', muted: true },
             { id: 't3', sceneId: 'scene-bbbb2222-2222-3333-4444-555555555555', name: 'Pad', role: 'pads' }, // different scene
           ],
         },
@@ -944,6 +1042,13 @@ describe('buildAmbientContext', () => {
     expect(text).toMatch(/"Drums" — role: drums/);
     expect(text).toMatch(/"Bass" — role: bass/);
     expect(text).not.toContain('Pad'); // belongs to a different scene
+
+    // Musical contract rides the same inspect round-trip (include:['musical_context']).
+    expect(text).toContain('Active scene contract: key=A minor bpm=120 chords=Am - F - C - G');
+
+    // Mute/solo flags surface inline, only when set.
+    expect(text).toMatch(/"Drums" — role: drums \[SOLO\]/);
+    expect(text).toMatch(/"Bass" — role: bass \[MUTED\]/);
   });
 
   it('uses NO bracketed UUID-prefix on scene names (regression guard for the [fdee5834] confusion)', async () => {
@@ -987,7 +1092,7 @@ describe('buildAmbientContext', () => {
     expect(text).toBe('');
   });
 
-  it('caps the preamble at ~2KB even with many scenes/tracks', async () => {
+  it('caps the preamble at ~2.6KB even with many scenes/tracks', async () => {
     const scenes = Array.from({ length: 50 }, (_, i) => ({
       id: `scene-${i.toString().padStart(8, '0')}`,
       name: `Scene ${i}`,
@@ -1012,7 +1117,7 @@ describe('buildAmbientContext', () => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const text = await buildAmbientContext(host as any);
-    expect(text.length).toBeLessThanOrEqual(2_000);
+    expect(text.length).toBeLessThanOrEqual(2_600);
     expect(text).toContain('+'); // truncation indicator from "+N more" hint
   });
 
@@ -1033,6 +1138,78 @@ describe('buildAmbientContext', () => {
     expect(text).toContain('"Lone"');
     expect(text).not.toContain('Active scene name:');
     expect(text).not.toContain('Active scene id  :');
+  });
+
+  describe('memory + session-goals injection', () => {
+    function makeMemoryAmbientHost(opts: { ledger?: unknown; journal?: string }) {
+      const store = new Map<string, unknown>();
+      if (opts.ledger !== undefined) store.set('chat.taskLedger', opts.ledger);
+      return {
+        listAppTools: jest.fn().mockResolvedValue([]),
+        getActiveSceneId: jest.fn(() => 'scene-1'),
+        getMutationSeq: jest.fn(() => 1),
+        getProjectData: jest.fn(async (k: string) => store.get(k) ?? null),
+        executeAppTool: jest.fn(async (name: string) => {
+          if (name === 'sas_project_notes_read') {
+            return {
+              success: true,
+              action: name,
+              data: {
+                success: true,
+                action: name,
+                changes: { body: opts.journal ?? '', exists: Boolean(opts.journal) },
+              },
+            };
+          }
+          return {
+            success: true,
+            action: name,
+            data: {
+              success: true,
+              action: name,
+              changes: {
+                project: { id: 'p1', name: 'Demo', activeSceneId: 'scene-1' },
+                scenes: [{ id: 'scene-1', name: 'Verse', displayName: 'Verse' }],
+                tracks: [],
+              },
+            },
+          };
+        }),
+      };
+    }
+
+    it('renders open session goals from the ledger (done items collapse to a counter)', async () => {
+      const host = makeMemoryAmbientHost({
+        ledger: [
+          { text: 'Make drums punchier', status: 'in_progress' },
+          { text: 'Add a riser', status: 'todo' },
+          { text: 'Pick a key', status: 'done' },
+        ],
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(host as any);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const text = await buildAmbientContext(host as any);
+
+      expect(text).toContain('Session goals');
+      expect(text).toMatch(/1\. \[in progress\] Make drums punchier/);
+      expect(text).toMatch(/2\. \[todo\] Add a riser/);
+      expect(text).not.toContain('Pick a key'); // done items are hidden
+      expect(text).toContain('(+1 done)');
+    });
+
+    it('renders the journal tail as "Remembered notes & preferences"', async () => {
+      const host = makeMemoryAmbientHost({
+        journal: 'User likes jazzy 7th chords.\nKeep choruses 8 bars.',
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(host as any);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const text = await buildAmbientContext(host as any);
+
+      expect(text).toContain('Remembered notes & preferences');
+      expect(text).toContain('Keep choruses 8 bars.');
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -1076,6 +1253,54 @@ describe('buildAmbientContext', () => {
       };
     }
 
+    it('hits the cache across turns even though executeAppTool bumps the seq (production model)', async () => {
+      // In production EVERY executeAppTool — including the preamble's own
+      // inspect — bumps getMutationSeq (broadcastMutation). Snapshotting the
+      // seq AFTER the build (not before) is what lets a no-external-change turn
+      // still hit the cache instead of recomputing forever.
+      const seqState = { value: 10 };
+      const executeAppTool = jest.fn(async (name: string) => {
+        seqState.value++; // model the broadcastMutation bump on every executeAppTool
+        return {
+          success: true,
+          action: name,
+          data: {
+            success: true,
+            action: name,
+            changes: {
+              project: { id: 'p1', name: 'Demo', activeSceneId: 'scene-1' },
+              scenes: [{ id: 'scene-1', name: 'S', displayName: 'S' }],
+              tracks: [],
+            },
+          },
+        };
+      });
+      const host = {
+        listAppTools: jest.fn().mockResolvedValue(SCENE_TOOLS),
+        getActiveSceneId: jest.fn(() => 'scene-1'),
+        executeAppTool,
+        getMutationSeq: jest.fn(() => seqState.value),
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(host as any);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const first = await buildAmbientContext(host as any);
+      const inspects1 = executeAppTool.mock.calls.filter(
+        (c) => c[0] === 'sas_inspect_project',
+      ).length;
+      // No external mutation between turns → the second build must hit cache.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const second = await buildAmbientContext(host as any);
+      const inspects2 = executeAppTool.mock.calls.filter(
+        (c) => c[0] === 'sas_inspect_project',
+      ).length;
+
+      expect(first).toBe(second);
+      expect(inspects2).toBe(inspects1); // cache hit despite the seq bumps
+      expect(second).not.toContain('state changed since your last turn');
+    });
+
     it('returns cached preamble when active scene + mutation seq are unchanged', async () => {
       const h = makeSeqHost({ initialSeq: 5 });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1087,8 +1312,12 @@ describe('buildAmbientContext', () => {
       const second = await buildAmbientContext(h.host as any);
 
       expect(first).toBe(second);
-      // One inspect call total — the second invocation hit cache.
-      expect(h.execute).toHaveBeenCalledTimes(1);
+      // One inspect (recompute) — the second invocation hit cache. Count
+      // inspect calls, not total executeAppTool: each build also reads the
+      // journal via sas_project_notes_read.
+      expect(
+        h.execute.mock.calls.filter((c) => c[0] === 'sas_inspect_project'),
+      ).toHaveLength(1);
     });
 
     it('invalidates cache when getMutationSeq() changes (any mutation)', async () => {
@@ -1103,7 +1332,38 @@ describe('buildAmbientContext', () => {
       await buildAmbientContext(h.host as any);
 
       // Re-inspected because a mutation occurred between turns.
-      expect(h.execute).toHaveBeenCalledTimes(2);
+      expect(
+        h.execute.mock.calls.filter((c) => c[0] === 'sas_inspect_project'),
+      ).toHaveLength(2);
+    });
+
+    it('prepends a "state changed" breadcrumb when a mutation lands on the same scene', async () => {
+      const h = makeSeqHost({ initialSeq: 5 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(h.host as any);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const first = await buildAmbientContext(h.host as any);
+      // First turn has no prior snapshot → no breadcrumb.
+      expect(first).not.toContain('state changed since your last turn');
+
+      h.bumpSeq(); // a mutation lands while the active scene is unchanged
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const second = await buildAmbientContext(h.host as any);
+      expect(second).toContain('state changed since your last turn');
+    });
+
+    it('does NOT show the breadcrumb on a scene change (different scene, not a same-scene mutation)', async () => {
+      const h = makeSeqHost({ initialSeq: 5 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      _resetAmbientCacheForTests(h.host as any);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await buildAmbientContext(h.host as any);
+      h.setSceneId('scene-bbbb2222-2222-3333-4444-555555555555');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const second = await buildAmbientContext(h.host as any);
+      expect(second).not.toContain('state changed since your last turn');
     });
 
     it('invalidates immediately on active-scene change (even without a mutation)', async () => {
@@ -1117,7 +1377,9 @@ describe('buildAmbientContext', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await buildAmbientContext(h.host as any);
 
-      expect(h.execute).toHaveBeenCalledTimes(2);
+      expect(
+        h.execute.mock.calls.filter((c) => c[0] === 'sas_inspect_project'),
+      ).toHaveLength(2);
     });
 
     it('falls back to TTL when host predates SDK 2.6 (no getMutationSeq)', async () => {
@@ -1150,8 +1412,11 @@ describe('buildAmbientContext', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await buildAmbientContext(host as any);
 
-      // Hit the cache via TTL — both calls within the 5s window.
-      expect(execute).toHaveBeenCalledTimes(1);
+      // Hit the cache via TTL — both calls within the 5s window. Count inspect
+      // recomputes, not total executeAppTool (each build also reads the journal).
+      expect(
+        execute.mock.calls.filter((c) => c[0] === 'sas_inspect_project'),
+      ).toHaveLength(1);
     });
   });
 });

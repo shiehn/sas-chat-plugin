@@ -42,7 +42,7 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
   it('defines Role with the canonical plural-form examples', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Role:/);
     // Canonical roles are plural (see
-    // sas-assistant/src/music-engine/constants/instrument-classification.ts).
+    // sas-app/src/music-engine/constants/instrument-classification.ts).
     // If the source-of-truth list changes, update both this test and
     // the system prompt so they stay in lockstep.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/kicks/);
@@ -110,6 +110,32 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     // entity-by-name pattern that historically failed without inspection.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_inspect_project/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Don't guess/i);
+  });
+
+  it('tells the agent the active scene contract is in the auto-injected preamble', () => {
+    // The ambient "Current state" block now carries the active scene's
+    // key/BPM/chords, so the agent should read it there instead of spending a
+    // round-trip on get_musical_context just to learn the key or tempo.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/get_musical_context/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Current state/);
+  });
+
+  it('teaches co-creative options (planOnly) and objective self-verification', () => {
+    // Propose options only for open-ended/taste requests, via planOnly plan-emitters.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/planOnly/);
+    // Self-verify only objective constraints, via render → analyze.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_render_preview/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_analyze_audio/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/objective/i);
+  });
+
+  it('teaches working-memory bookkeeping (session ledger + persistent journal)', () => {
+    // Session goals survive scene changes via the ledger; durable preferences
+    // go to the per-project journal. Both are silent bookkeeping.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/chat_task_ledger/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_project_notes_write/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_project_notes_read/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/survives scene changes/i);
   });
 
   it('teaches transient-failure retry via the STRUCTURAL retryable signal (no hardcoded phrase list)', () => {

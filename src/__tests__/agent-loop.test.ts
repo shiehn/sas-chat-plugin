@@ -515,6 +515,59 @@ describe('AgentLoop', () => {
     expect(secondCall.contents[2].role).toBe('user');
   });
 
+  it('preserves Gemini-3 functionCall.thoughtSignature verbatim on the next turn', async () => {
+    // Gemini-3 stamps a `thoughtSignature` on functionCall parts that MUST be
+    // replayed exactly on the following turn or the API 400s. The loop copies
+    // the model's parts by reference into history, so the field must survive
+    // into the next request's `contents`.
+    const SIGNATURE = 'thought-sig-abc123==';
+    const host = {
+      generateWithLLMTools: jest.fn() as jest.Mock,
+    };
+    host.generateWithLLMTools
+      .mockResolvedValueOnce({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                { functionCall: { name: 'set_volume', args: {}, thoughtSignature: SIGNATURE } } as any,
+              ],
+            },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        candidates: [{ content: { role: 'model', parts: [{ text: 'done' }] } }],
+      });
+
+    const loop = new AgentLoop({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      host: host as any,
+      tools: TOOLS,
+      toolExecutor: jest.fn().mockResolvedValue({
+        success: true,
+        exitCode: 0,
+        stdout: '{}',
+        stderr: '',
+      }) as ToolExecutor,
+      systemPrompt: SYSTEM_PROMPT,
+    });
+
+    await loop.run('quieter please');
+
+    const secondCall = host.generateWithLLMTools.mock.calls[1][0] as {
+      contents: Array<{
+        role: string;
+        parts: Array<{ functionCall?: { thoughtSignature?: string } }>;
+      }>;
+    };
+    // contents[1] is the model turn carrying the functionCall part.
+    const fcPart = secondCall.contents[1].parts.find((p) => p.functionCall);
+    expect(fcPart?.functionCall?.thoughtSignature).toBe(SIGNATURE);
+  });
+
   it('recovers from a Gemini 400 "function response turn" error by resetting history and retrying once', async () => {
     // Long history accumulated from prior failed turns:
     // user → model(text) → user → model(fc) → user(fr) → model(text)

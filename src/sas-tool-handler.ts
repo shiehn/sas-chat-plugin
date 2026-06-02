@@ -8,7 +8,7 @@
  * The handler does NOT import `electron` directly — it accepts `appExe` and
  * `cliEntry` as inputs. The chat plugin wires those in main-side activation
  * via `app.getPath('exe')` and the same logic the CLI installer uses (see
- * `sas-assistant/src/main/ipc-cli-install.ts:resolveInstallParams`). This
+ * `sas-app/src/main/ipc-cli-install.ts:resolveInstallParams`). This
  * keeps the plugin testable without spinning up Electron and makes a
  * potential renderer-side stub trivial.
  *
@@ -102,7 +102,7 @@ const DEFAULT_TIMEOUT_MS = 300_000;
  * Convert a parameters object to CLI args using the `--json '{...}'`
  * escape hatch.
  *
- * The active CLI (`sas-assistant/cli/sas.ts`) parses `--key value` and
+ * The active CLI (`sas-app/cli/sas.ts`) parses `--key value` and
  * `--json '{...}'`, but NOT bare `key=value` positionals — those land in
  * `positionals[]` and never reach `params`. Earlier versions of this
  * function emitted bare-KV form which silently dropped every argument

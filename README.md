@@ -129,7 +129,7 @@ The plugin requires SDK 2.4.0+ for two new `PluginHost` methods:
 
 The host's `generateWithLLMTools` posts to `<sas-gateway>/v1/gemini/v1beta/models/{model}:generateContent`, which forwards verbatim to Google after adding the central API key.
 
-Subprocess invocation uses the same `electronExe + ELECTRON_RUN_AS_NODE=1 + cliEntry` pattern as `sas-assistant`'s CLI installer — works in dev and packaged builds without depending on the user having `sas` on their shell PATH.
+Subprocess invocation uses the same `electronExe + ELECTRON_RUN_AS_NODE=1 + cliEntry` pattern as `sas-app`'s CLI installer — works in dev and packaged builds without depending on the user having `sas` on their shell PATH.
 
 ## The Signals & Sorcery Ecosystem
 

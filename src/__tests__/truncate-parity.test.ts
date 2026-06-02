@@ -1,18 +1,18 @@
 /**
  * Cross-repo parity tests for `truncateForLLM`.
  *
- * Mirror of `sas-assistant/src/shared/utils/__tests__/truncate-parity.test.ts`.
+ * Mirror of `sas-app/src/shared/utils/__tests__/truncate-parity.test.ts`.
  * Loads the same shared fixture file via monorepo-relative path and
  * exercises the chat-plugin's inline copy of `truncateForLLM`. If the
  * two implementations of the truncator ever diverge (one updated, the
  * other forgotten), one of these suites surfaces it.
  *
  * Fixture path is monorepo-layout-dependent. If the chat-plugin is
- * checked out standalone (no sibling sas-assistant), this test skips
+ * checked out standalone (no sibling sas-app), this test skips
  * cleanly rather than failing.
  *
  * Resolves the cross-repo parity follow-up in
- * `sas-assistant/docs/chat-cli-architecture.md` § 2.6.
+ * `sas-app/docs/chat-cli-architecture.md` § 2.6.
  */
 
 import * as fs from 'fs';
@@ -24,7 +24,7 @@ const FIXTURE_PATH = path.resolve(
   '..',
   '..',
   '..',
-  'sas-assistant',
+  'sas-app',
   'src',
   'shared',
   'utils',
@@ -103,7 +103,7 @@ const fixture: ParityFixture | null = hasFixture
 // portable for someone who checks it out standalone.
 const d = hasFixture ? describe : describe.skip;
 
-d('truncateForLLM parity (shared fixture from sas-assistant)', () => {
+d('truncateForLLM parity (shared fixture from sas-app)', () => {
   it('fixture file resolves and parses', () => {
     expect(fixture).not.toBeNull();
     expect(Array.isArray(fixture!.cases)).toBe(true);

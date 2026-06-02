@@ -22,10 +22,10 @@ import type {
   LLMFunctionDeclaration,
 } from '@signalsandsorcery/plugin-sdk';
 import { invokeSas } from './sas-tool-handler';
-import type { AgentNextStep, ToolExecutor } from './agent-loop';
-import { ASK_USER_TOOL_NAME } from './constants';
+import type { AgentNextStep, ToolExecutor, ToolExecutionResult } from './agent-loop';
+import { ASK_USER_TOOL_NAME, CHAT_TASK_LEDGER_TOOL_NAME } from './constants';
 
-export { ASK_USER_TOOL_NAME };
+export { ASK_USER_TOOL_NAME, CHAT_TASK_LEDGER_TOOL_NAME };
 
 export interface PanelTools {
   /** LLM-facing tool declarations (single `LLMTool` wrapping all functions). */
@@ -79,9 +79,18 @@ export async function buildPanelTools(
   const declarations: LLMFunctionDeclaration[] = appTools.map(
     toFunctionDeclaration,
   );
+  // Promote the persistent per-project journal (sas_project_notes_*) onto the
+  // default surface so the agent uses its cross-session memory without a
+  // tool_search first. They're project-scoped (excluded from the scene scan);
+  // we surface concise declarations here and let the executor's deferred-
+  // resolution path dispatch them — no extra build-time listAppTools call.
+  declarations.push(...buildMemoryToolDeclarations());
   if (awaitUserResponse) {
     declarations.push(buildAskUserDeclaration());
   }
+  // The session task/goal ledger is always available — plugin-local state, not
+  // gated on the clarification transport.
+  declarations.push(buildTaskLedgerDeclaration());
   const tools: LLMTool[] =
     declarations.length > 0 ? [{ functionDeclarations: declarations }] : [];
 
@@ -177,6 +186,12 @@ export async function buildPanelTools(
         const stderr = err instanceof Error ? err.message : String(err);
         return { success: false, exitCode: 1, stdout: '', stderr };
       }
+    }
+
+    if (name === CHAT_TASK_LEDGER_TOOL_NAME) {
+      // Synthetic tool — session goal ledger in project-scoped plugin_data.
+      // Bypasses the CLI subprocess entirely.
+      return handleTaskLedger(host, args);
     }
 
     let def: PluginAppTool | null = toolByName.get(name) ?? null;
@@ -308,6 +323,83 @@ function buildAskUserDeclaration(): LLMFunctionDeclaration {
   };
 }
 
+/**
+ * Synthetic declaration for `chat_task_ledger` — the session goal ledger the
+ * agent uses to stay on-task across turns. Backed by project-scoped storage
+ * (survives scene changes); surfaced back to the model in the ambient preamble.
+ */
+function buildTaskLedgerDeclaration(): LLMFunctionDeclaration {
+  return {
+    name: CHAT_TASK_LEDGER_TOOL_NAME,
+    description:
+      "Record and update the SESSION GOAL LEDGER — a short list of what you're accomplishing this session. It survives scene changes and is shown back to you in the 'Current state' preamble, so it keeps you on-task across turns. Call set_goals ONCE when the user gives a multi-step intent, then update each item to 'done' as you finish it; clear it when the work is complete. This is silent bookkeeping: do NOT announce ledger writes or ask permission, and do NOT use it for one-off single-step requests.",
+    parameters: {
+      type: 'object',
+      properties: {
+        op: {
+          type: 'string',
+          enum: ['set_goals', 'update', 'clear'],
+          description:
+            "set_goals: replace the whole list. update: change one item's status by its 1-based index. clear: empty the ledger when the work is done.",
+        },
+        goals: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'For set_goals: the ordered goal descriptions (each starts as todo).',
+        },
+        index: {
+          type: 'integer',
+          description:
+            'For update: the 1-based index of the goal as shown in the Current state preamble.',
+        },
+        status: {
+          type: 'string',
+          enum: ['todo', 'in_progress', 'done'],
+          description: 'For update: the new status of the goal.',
+        },
+      },
+      required: ['op'],
+    },
+  };
+}
+
+/** Concise chat-surface declarations for the persistent per-project journal
+ *  (cross-session memory). Hand-written rather than pulled from the registry so
+ *  surfacing them costs no extra build-time listAppTools call; execution still
+ *  flows through the real tool via the executor's deferred-resolution path. */
+function buildMemoryToolDeclarations(): LLMFunctionDeclaration[] {
+  return [
+    {
+      name: 'sas_project_notes_read',
+      description:
+        "Read the project's persistent journal — your cross-session memory of the user's durable preferences and past creative decisions. A tail of it is shown in the 'Current state' preamble; call this for the FULL history when the user asks a memory question or the tail is insufficient.",
+      parameters: { type: 'object', properties: {} },
+    },
+    {
+      name: 'sas_project_notes_write',
+      description:
+        "Append to the project's persistent journal — your cross-session memory. Use mode='append' to record ONE terse line when the user states a durable preference or makes a significant creative decision. Do NOT record ephemeral actions (use chat_task_ledger for session goals). Silent bookkeeping — don't ask permission.",
+      parameters: {
+        type: 'object',
+        properties: {
+          body: {
+            type: 'string',
+            description: 'Text to record. One terse line for append.',
+          },
+          mode: {
+            type: 'string',
+            enum: ['append', 'replace'],
+            description:
+              "Default 'append'. Use 'replace' only to rewrite/summarize the whole journal.",
+          },
+        },
+        required: ['body'],
+      },
+    },
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -425,12 +517,24 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // Ambient context — "you are here" preamble auto-refreshed each turn.
 // ---------------------------------------------------------------------------
 
-/** Cap the preamble at ~2KB so it doesn't crowd out tool descriptions or
- *  conversation history in the model's context budget. */
-const AMBIENT_CONTEXT_CAP = 2_000;
-const AMBIENT_MAX_SCENES = 12;
+/** Cap the preamble so it doesn't crowd out tool descriptions or conversation
+ *  history in the model's context budget. Bumped 2KB→2.6KB in Phase 2 to hold
+ *  the session-goals + remembered-preferences blocks. */
+const AMBIENT_CONTEXT_CAP = 2_600;
+const AMBIENT_MAX_SCENES = 8;
 const AMBIENT_MAX_TRACKS = 16;
 const AMBIENT_MAX_HISTORY = 3;
+/** Max open goals shown in the preamble; the rest collapse to a "+N more". */
+const AMBIENT_MAX_GOALS = 5;
+/** Byte budget for the journal tail injected as "Remembered preferences". */
+const AMBIENT_PREFS_TAIL = 700;
+
+/** project-scoped plugin_data key for the session task/goal ledger. */
+const TASK_LEDGER_KEY = 'chat.taskLedger';
+/** Prepended (only to the returned string, never the cached body) when the
+ *  project mutated since this host's last preamble render. */
+const STATE_CHANGED_NOTE =
+  'Note: project state changed since your last turn — trust the state below over your memory.';
 
 /** Time-based fallback for hosts that don't yet expose `getMutationSeq()`
  *  (SDK pre-2.6). Hosts on the new contract use the monotonic counter
@@ -465,7 +569,155 @@ const ambientCache = new WeakMap<PluginHost, AmbientCacheEntry>();
  * doesn't need to call it (the active-scene-id check + TTL handle drift).
  */
 export function _resetAmbientCacheForTests(host: PluginHost): void {
+  invalidateAmbientCache(host);
+}
+
+/**
+ * Invalidate the ambient preamble cache for a host. Needed after a state write
+ * that does NOT bump `getMutationSeq()` — notably a `setProjectData` task-ledger
+ * write. (The CLI / executeAppTool path self-invalidates because it broadcasts
+ * a mutation; the in-process key-value path does not.)
+ */
+export function invalidateAmbientCache(host: PluginHost): void {
   ambientCache.delete(host);
+}
+
+/** Read `host.getMutationSeq()` defensively (SDK 2.6+; null on older hosts). */
+function readMutationSeq(host: PluginHost): number | null {
+  const fn = (host as { getMutationSeq?: () => number }).getMutationSeq;
+  return typeof fn === 'function' ? fn.call(host) : null;
+}
+
+// --- Session task/goal ledger (project-scoped, survives scene change) -------
+
+type TaskStatus = 'todo' | 'in_progress' | 'done';
+interface TaskLedgerItem {
+  text: string;
+  status: TaskStatus;
+}
+
+function isTaskLedgerItem(v: unknown): v is TaskLedgerItem {
+  return (
+    isRecord(v) &&
+    typeof v.text === 'string' &&
+    (v.status === 'todo' || v.status === 'in_progress' || v.status === 'done')
+  );
+}
+
+/** Read the session ledger from project-scoped plugin_data. Defensive: returns
+ *  [] when the host lacks the storage API, the key is unset, or the value is
+ *  malformed. */
+async function readTaskLedger(host: PluginHost): Promise<TaskLedgerItem[]> {
+  const getter = (host as {
+    getProjectData?: <T>(key: string) => Promise<T | null>;
+  }).getProjectData;
+  if (typeof getter !== 'function') return [];
+  try {
+    const raw = await getter.call(host, TASK_LEDGER_KEY);
+    return Array.isArray(raw) ? raw.filter(isTaskLedgerItem) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Read the persistent per-project journal (cross-session memory). Defensive:
+ *  returns '' on any failure so a journal hiccup never drops the rest of the
+ *  preamble. */
+async function readProjectJournal(host: PluginHost): Promise<string> {
+  try {
+    const res = await host.executeAppTool('sas_project_notes_read', {});
+    if (!res.success) return '';
+    const data = isRecord(res.data) ? res.data : null;
+    const changes = data && isRecord(data.changes) ? data.changes : null;
+    return changes && typeof changes.body === 'string' ? changes.body.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Synthetic `chat_task_ledger` handler — bypasses the CLI and reads/writes the
+ * session goal ledger in project-scoped plugin_data. Ops: `set_goals` (replace
+ * the list), `update` (flip one item's status by 1-based index), `clear`.
+ */
+async function handleTaskLedger(
+  host: PluginHost,
+  args: Record<string, unknown>,
+): Promise<ToolExecutionResult> {
+  const setter = (host as {
+    setProjectData?: (key: string, value: unknown) => Promise<void>;
+  }).setProjectData;
+  const getter = (host as {
+    getProjectData?: <T>(key: string) => Promise<T | null>;
+  }).getProjectData;
+  if (typeof setter !== 'function' || typeof getter !== 'function') {
+    return {
+      success: false,
+      exitCode: 1,
+      stdout: '',
+      stderr:
+        'chat_task_ledger is unavailable in this session (host lacks project-data storage).',
+    };
+  }
+
+  const op = typeof args.op === 'string' ? args.op : '';
+  let ledger = await readTaskLedger(host);
+
+  if (op === 'set_goals') {
+    const goals = Array.isArray(args.goals)
+      ? args.goals.filter(
+          (g): g is string => typeof g === 'string' && g.trim().length > 0,
+        )
+      : [];
+    ledger = goals.map((text) => ({ text: text.trim(), status: 'todo' as const }));
+  } else if (op === 'update') {
+    const index = typeof args.index === 'number' ? args.index : Number(args.index);
+    const status = args.status;
+    if (!Number.isInteger(index) || index < 1 || index > ledger.length) {
+      return {
+        success: false,
+        exitCode: 1,
+        stdout: '',
+        stderr: `chat_task_ledger update: index ${String(args.index)} is out of range (1..${ledger.length}).`,
+      };
+    }
+    if (status !== 'todo' && status !== 'in_progress' && status !== 'done') {
+      return {
+        success: false,
+        exitCode: 1,
+        stdout: '',
+        stderr:
+          "chat_task_ledger update: 'status' must be todo, in_progress, or done.",
+      };
+    }
+    ledger[index - 1] = { ...ledger[index - 1], status };
+  } else if (op === 'clear') {
+    ledger = [];
+  } else {
+    return {
+      success: false,
+      exitCode: 1,
+      stdout: '',
+      stderr: `chat_task_ledger: unknown op '${op}'. Use set_goals, update, or clear.`,
+    };
+  }
+
+  try {
+    await setter.call(host, TASK_LEDGER_KEY, ledger);
+  } catch (err) {
+    const stderr = err instanceof Error ? err.message : String(err);
+    return { success: false, exitCode: 1, stdout: '', stderr };
+  }
+  // setProjectData does NOT broadcast a mutation, so without this the cached
+  // preamble would not reflect the write until the next real mutation/TTL.
+  invalidateAmbientCache(host);
+
+  const summary =
+    ledger.length === 0
+      ? 'Session ledger cleared.'
+      : 'Session ledger:\n' +
+        ledger.map((g, i) => `  ${i + 1}. [${g.status}] ${g.text}`).join('\n');
+  return { success: true, exitCode: 0, stdout: summary, stderr: '' };
 }
 
 interface AmbientScene {
@@ -479,6 +731,10 @@ interface AmbientTrack {
   name?: string;
   displayName?: string;
   role?: string;
+  /** Pass-through from gatherCurrentState so the preamble can flag silenced
+   *  tracks without a second tool call (prerequisite-graph.ts). */
+  muted?: boolean;
+  solo?: boolean;
 }
 interface AmbientHistory {
   action?: string;
@@ -503,12 +759,9 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
   // (preferred) or a recent compute (TTL fallback) returns the cached
   // preamble. Active-scene change blows the cache immediately.
   const activeSceneIdFromHost = host.getActiveSceneId() ?? null;
-  // `getMutationSeq` is SDK 2.6+. Optional-chain so older hosts fall
-  // through to the TTL path silently.
-  const currentSeq: number | null =
-    typeof (host as { getMutationSeq?: () => number }).getMutationSeq === 'function'
-      ? (host as { getMutationSeq: () => number }).getMutationSeq()
-      : null;
+  // `getMutationSeq` is SDK 2.6+. `readMutationSeq` returns null on older
+  // hosts, which falls through to the TTL path silently.
+  const currentSeq = readMutationSeq(host);
   const cached = ambientCache.get(host);
   if (cached && cached.activeSceneId === activeSceneIdFromHost) {
     // Preferred: mutation-seq-keyed invalidation. No mutation since last
@@ -531,9 +784,20 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
     }
   }
 
+  // Detect "same active scene, but a mutation landed since we last rendered"
+  // — used to prepend a one-line breadcrumb so the model trusts the fresh
+  // state below over its own memory. Excludes the scene-change case (a
+  // different scene entirely) and the TTL-only path (no seq to compare).
+  const stateChangedSinceLastTurn =
+    cached !== undefined &&
+    cached.activeSceneId === activeSceneIdFromHost &&
+    currentSeq !== null &&
+    cached.mutationSeq !== null &&
+    cached.mutationSeq !== currentSeq;
+
   try {
     const result = await host.executeAppTool('sas_inspect_project', {
-      include: ['scenes', 'tracks', 'history'],
+      include: ['scenes', 'tracks', 'musical_context', 'history'],
     });
     if (!result.success) return '';
     // executeAppTool wraps the OperationResult in `data` (see
@@ -552,6 +816,13 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
     const history: AmbientHistory[] = Array.isArray(changes.history)
       ? (changes.history as AmbientHistory[])
       : [];
+    const musicalContext = isRecord(changes.musical_context)
+      ? changes.musical_context
+      : null;
+
+    // Cross-session + session state (defensive; neither blocks the preamble).
+    const ledger = await readTaskLedger(host);
+    const journalBody = await readProjectJournal(host);
 
     const lines: string[] = ['=== Current state (auto-refreshed each turn) ==='];
 
@@ -583,6 +854,68 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
       );
     }
 
+    // Active scene's musical contract (key / BPM / chords). Rides the same
+    // inspect round-trip via include:['musical_context'] — saves the agent a
+    // separate get_musical_context call when it reasons about "does this match
+    // the key/tempo?". Chord strings can be long, so cap them so they can't
+    // blow the ambient budget.
+    if (typeof activeSceneId === 'string' && musicalContext) {
+      const key = typeof musicalContext.key === 'string' ? musicalContext.key : 'unknown';
+      const bpm = typeof musicalContext.bpm === 'number' ? musicalContext.bpm : '?';
+      const rawChords =
+        typeof musicalContext.chord_progression === 'string'
+          ? musicalContext.chord_progression
+          : '';
+      const chords = rawChords
+        ? rawChords.length > 80
+          ? `${rawChords.slice(0, 80)}…`
+          : rawChords
+        : 'none';
+      lines.push(`Active scene contract: key=${key} bpm=${bpm} chords=${chords}`);
+    }
+
+    // Session goals — what we're working on this session. Backed by
+    // project-scoped storage so it survives scene changes; kept here so the
+    // agent stays on-task across turns. Show open items with their 1-based
+    // ledger index (chat_task_ledger `update` references that index).
+    if (ledger.length > 0) {
+      const open = ledger
+        .map((g, i) => ({ g, n: i + 1 }))
+        .filter((e) => e.g.status !== 'done');
+      if (open.length > 0) {
+        lines.push('Session goals (update status via chat_task_ledger):');
+        for (const { g, n } of open.slice(0, AMBIENT_MAX_GOALS)) {
+          const mark = g.status === 'in_progress' ? 'in progress' : 'todo';
+          lines.push(`  ${n}. [${mark}] ${g.text}`);
+        }
+        if (open.length > AMBIENT_MAX_GOALS) {
+          lines.push(`  (+${open.length - AMBIENT_MAX_GOALS} more open)`);
+        }
+        const done = ledger.length - open.length;
+        if (done > 0) lines.push(`  (+${done} done)`);
+      }
+    }
+
+    // Tracks in the active scene — load-bearing, so listed BEFORE the full
+    // scene table. Mute/solo flags ride the same payload (gatherCurrentState
+    // passes them through); shown only when set so the common case stays quiet.
+    if (activeSceneId) {
+      const sceneTracks = tracks.filter((t) => t.sceneId === activeSceneId);
+      if (sceneTracks.length > 0) {
+        const visible = sceneTracks.slice(0, AMBIENT_MAX_TRACKS);
+        lines.push(`Tracks in active scene (${sceneTracks.length}):`);
+        for (const t of visible) {
+          const name = t.displayName ?? t.name ?? '(unnamed)';
+          const roleSuffix = t.role ? ` — role: ${t.role}` : '';
+          const flags = `${t.muted ? ' [MUTED]' : ''}${t.solo ? ' [SOLO]' : ''}`;
+          lines.push(`  - "${name}"${roleSuffix}${flags}`);
+        }
+        if (sceneTracks.length > AMBIENT_MAX_TRACKS) {
+          lines.push(`  - (+${sceneTracks.length - AMBIENT_MAX_TRACKS} more)`);
+        }
+      }
+    }
+
     // Scene listing as an explicit name→id mapping table. The previous
     // inline `[id-prefix]` format lured Gemini into passing the id AS a
     // sceneName argument; the arrow format keeps name and id structurally
@@ -602,28 +935,28 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
       }
     }
 
-    if (activeSceneId) {
-      const sceneTracks = tracks.filter((t) => t.sceneId === activeSceneId);
-      if (sceneTracks.length > 0) {
-        const visible = sceneTracks.slice(0, AMBIENT_MAX_TRACKS);
-        lines.push(`Tracks in active scene (${sceneTracks.length}):`);
-        for (const t of visible) {
-          const name = t.displayName ?? t.name ?? '(unnamed)';
-          const roleSuffix = t.role ? ` — role: ${t.role}` : '';
-          lines.push(`  - "${name}"${roleSuffix}`);
-        }
-        if (sceneTracks.length > AMBIENT_MAX_TRACKS) {
-          lines.push(`  - (+${sceneTracks.length - AMBIENT_MAX_TRACKS} more)`);
-        }
-      }
-    }
-
     if (history.length > 0) {
       const recent = history
         .slice(0, AMBIENT_MAX_HISTORY)
         .map((h) => h.action ?? h.description ?? '?')
         .join(' → ');
       lines.push(`Recent actions: ${recent}`);
+    }
+
+    // Remembered notes & preferences — tail of the persistent per-project
+    // journal (cross-session memory). Bounded tail-slice; the agent reads the
+    // full body via sas_project_notes_read when it needs more.
+    if (journalBody) {
+      lines.push(
+        'Remembered notes & preferences (journal tail — read full via sas_project_notes_read):',
+      );
+      let budget = AMBIENT_PREFS_TAIL;
+      for (const ln of journalBody.split('\n').slice(-8)) {
+        if (budget <= 0) break;
+        const clipped = ln.length > budget ? ln.slice(0, budget) : ln;
+        lines.push(`  ${clipped}`);
+        budget -= clipped.length + 1;
+      }
     }
 
     lines.push('=== End current state ===');
@@ -637,13 +970,20 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
             return joined.slice(0, AMBIENT_CONTEXT_CAP - suffix.length) + suffix;
           })();
 
+    // Snapshot the seq AFTER the executeAppTool calls above — each bumps it via
+    // broadcastMutation, so the pre-build value (read at the top) never matches
+    // next turn and the cache would recompute forever. The post-build value
+    // equals next turn's start-of-turn seq when nothing mutated externally → hit.
+    const seqAfterBuild = readMutationSeq(host);
     ambientCache.set(host, {
       activeSceneId: activeSceneIdFromHost,
       ts: Date.now(),
-      mutationSeq: currentSeq,
+      mutationSeq: seqAfterBuild,
       ambient,
     });
-    return ambient;
+    // The breadcrumb is turn-relative — keep it OUT of the cached body (a later
+    // cache hit means nothing changed) and prepend it only to this return.
+    return stateChangedSinceLastTurn ? `${STATE_CHANGED_NOTE}\n${ambient}` : ambient;
   } catch {
     // Don't poison the cache on transient failure — let the next call try
     // again. Empty string signals "skip preamble injection".

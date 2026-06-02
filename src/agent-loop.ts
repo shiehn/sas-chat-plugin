@@ -28,7 +28,7 @@ import type {
 /**
  * A suggested follow-up the executor surfaces alongside a successful tool
  * call. Structurally mirrors `OperationResult.nextSteps[]` from
- * `sas-assistant/src/shared/types/tool-result.ts` but is declared locally so
+ * `sas-app/src/shared/types/tool-result.ts` but is declared locally so
  * `agent-loop` stays decoupled from SAS-specific types (Errantry-PI and any
  * future plugin can populate the field too).
  */
@@ -440,6 +440,13 @@ export class AgentLoop {
       // "function response turn comes immediately after a function call
       // turn" error — force `role: 'model'` here so we always send a
       // well-formed turn.
+      //
+      // Gemini-3 also stamps a `thoughtSignature` on functionCall parts that
+      // MUST be replayed verbatim on the next turn or the API rejects with a
+      // 400. We copy `candidate.content.parts` by reference, so the field
+      // survives intact — any future refactor that maps/filters/rebuilds parts
+      // here MUST carry `functionCall.thoughtSignature` through. The round-trip
+      // test in agent-loop.test.ts guards this.
       const modelContent: LLMContent = {
         role: candidate.content.role ?? 'model',
         parts: candidate.content.parts ?? [],
@@ -591,10 +598,10 @@ function hasText(part: LLMPart): part is LLMPart & { text: string } {
  *  payloads (db_query rows, candidate lists). For everything else it falls
  *  back to head + tail slicing.
  *
- *  ⚠️ KEEP IN SYNC with `sas-assistant/src/shared/utils/operation-result-truncate.ts`.
+ *  ⚠️ KEEP IN SYNC with `sas-app/src/shared/utils/operation-result-truncate.ts`.
  *  This is the canonical algorithm; it lives here too because the chat-plugin
  *  is a sibling repo (git submodule) and can't import directly from
- *  sas-assistant. If you change either copy, propagate to the other.
+ *  sas-app. If you change either copy, propagate to the other.
  *  Resolves C-4 in `docs/chat-cli-architecture.md`. A parity test lives in
  *  the chat-plugin's __tests__ to catch drift.
  */

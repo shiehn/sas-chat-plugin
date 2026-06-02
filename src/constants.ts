@@ -8,3 +8,8 @@
 
 /** Synthetic tool name for the model-driven clarification path. */
 export const ASK_USER_TOOL_NAME = 'ask_user';
+
+/** Synthetic tool name for the session task/goal ledger. Backed by the host's
+ *  project-scoped key-value store (`plugin_data`), so it survives scene changes
+ *  and app restarts — unlike the agent loop's in-memory conversation history. */
+export const CHAT_TASK_LEDGER_TOOL_NAME = 'chat_task_ledger';
