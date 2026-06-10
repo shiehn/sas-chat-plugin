@@ -95,6 +95,17 @@ const CLI_PATHS = { appExe: '/fake/Electron', cliEntry: '/fake/dist/cli/sas.js' 
 // Tests
 // ---------------------------------------------------------------------------
 
+// This suite pins the CLI transport's dispatch mechanics (Phase 2a made
+// 'in-process' the default; 'cli' remains the SAS_CHAT_TOOL_TRANSPORT=cli
+// rollback path). The in-process transport has its own suite in
+// panel-tools-in-process.test.ts.
+beforeAll(() => {
+  process.env.SAS_CHAT_TOOL_TRANSPORT = 'cli';
+});
+afterAll(() => {
+  delete process.env.SAS_CHAT_TOOL_TRANSPORT;
+});
+
 describe('buildPanelTools', () => {
   beforeEach(() => {
     mockInvokeSas.mockReset();
@@ -117,8 +128,9 @@ describe('buildPanelTools', () => {
 
     expect(host.listAppTools).toHaveBeenCalledWith({ scope: 'scene' });
     expect(result.tools).toHaveLength(1); // one LLMTool wrapping all decls
-    // 2 scene tools + 2 promoted journal tools + the chat_task_ledger synthetic.
-    expect(result.tools[0].functionDeclarations).toHaveLength(5);
+    // 2 scene tools + 2 promoted journal tools + the chat_task_ledger and
+    // producer_preferences synthetics.
+    expect(result.tools[0].functionDeclarations).toHaveLength(6);
     expect(result.tools[0].functionDeclarations[0]).toEqual(
       expect.objectContaining({
         name: 'scene_get_tracks',
@@ -150,6 +162,7 @@ describe('buildPanelTools', () => {
       'sas_project_notes_read',
       'sas_project_notes_write',
       'chat_task_ledger',
+      'producer_preferences',
     ]);
   });
 
@@ -302,7 +315,21 @@ describe('buildPanelTools', () => {
     });
 
     it('(c) concurrent misses share one in-flight listAppTools call (single-flight)', async () => {
+      // Phase 5b pre-seeds the deferred cache from the build-time promotion
+      // scan; fail that scan so the LAZY single-flight path (what this test
+      // pins) is the one that runs.
       const host = makeSplitHost();
+      let deferredCallCount = 0;
+      host.listAppTools.mockImplementation((opts?: { includeDeferred?: boolean }) => {
+        if (opts?.includeDeferred) {
+          deferredCallCount += 1;
+          if (deferredCallCount === 1) {
+            return Promise.reject(new Error('registry busy during build'));
+          }
+          return Promise.resolve(FULL_TOOLS);
+        }
+        return Promise.resolve(SCENE_TOOLS);
+      });
       const { executor } = await buildPanelTools({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         host: host as any,
@@ -351,7 +378,9 @@ describe('buildPanelTools', () => {
       host.listAppTools.mockImplementation((opts?: { includeDeferred?: boolean }) => {
         if (opts?.includeDeferred) {
           deferredCallCount += 1;
-          if (deferredCallCount === 1) {
+          // Call 1 = the Phase-5b build-time promotion scan (failure caught
+          // silently); call 2 = the lazy lookup this test pins.
+          if (deferredCallCount <= 2) {
             return Promise.reject(new Error('engine unreachable'));
           }
           return Promise.resolve(FULL_TOOLS);
@@ -375,7 +404,7 @@ describe('buildPanelTools', () => {
       // (now successful) listAppTools impl and dispatches.
       const second = await executor('render_to_performance', {});
       expect(second.success).toBe(true);
-      expect(deferredCallCount).toBe(2);
+      expect(deferredCallCount).toBe(3);
       expect(mockInvokeSas).toHaveBeenCalledTimes(1);
     });
 

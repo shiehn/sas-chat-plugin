@@ -33,6 +33,9 @@ import type {
   AgentLoopEvent,
   AgentLoopResult,
 } from './agent-loop';
+import type { AgentBackend } from './backend';
+import { GeminiBackend, GEMINI_DEFAULT_MODEL } from './gemini-backend';
+import { ConversationStore } from './conversation-store';
 import type { PanelTools } from './panel-tools';
 import { ChatPanel } from './ui/ChatPanel';
 
@@ -95,6 +98,12 @@ export interface ChatPanelPluginOptions {
    * end the turn.
    */
   awaitClarification?: AwaitClarification;
+  /**
+   * Persist the conversation per-project across app restarts (Phase 2b).
+   * Default true. Rollback switch: pass false to restore the pre-2b
+   * in-memory-only behavior.
+   */
+  persistConversation?: boolean;
 }
 
 export const DEFAULT_SYSTEM_PROMPT = `You are an AI assistant embedded in the Signals & Sorcery loop workstation.
@@ -130,6 +139,10 @@ How to work:
 - Be concise. The user can hear the result; explanations are for when something needs explaining.
 - Your default tool list is scene-scoped. For project-wide actions (deck control "play loop-a / loop-b", audio routing, project switching, transitions, history/undo, audio export), call \`tool_search\` with a keyword query FIRST — most capabilities not on your default list are reachable that way, then invoke the returned tool by name. You do NOT need to ask the user before invoking a tool you found via tool_search; just call it.
 
+Taste memory & feedback (the producer loop — this is what makes you a collaborator, not a command runner):
+- When the user REACTS to something they heard with a preference signal ("the bass is too loud", "love that swing", "less busy hats please"), do two things: (1) act on it, and (2) record ONE structured lesson via \`producer_preferences\` op=add. Use source='explicit' ONLY when the user literally said it; source='inferred' for lessons you deduced from their reaction. One terse sentence; never duplicate an existing entry (they're shown in "Producer preferences" in Current state — honor those without being asked, and update/remove entries that the user contradicts).
+- After an AUDIBLE milestone (a new scene composed, a substantial revision), elicit feedback with \`ask_user\` offering 2–4 CONCRETE directions as options ("brighter", "darker", "keep it") instead of an open "what do you think?". Skip the elicitation when the user gave a precise directive that you simply executed, and never ask twice in a row.
+
 Working memory & session goals (silent bookkeeping — keep it current, never ask permission to record):
 - For a multi-step request, call \`chat_task_ledger\` with op=set_goals ONCE to record the plan, then op=update each item to done as you finish it. The ledger is shown back to you in the "Current state" preamble and survives scene changes, so it keeps you on-task across turns. Don't use it for one-off single-step asks, and don't announce ledger writes.
 - The project has a persistent journal (cross-session memory). When the user states a durable preference ("always mix the bass low", "keep choruses 8 bars") or makes a significant creative decision, append ONE terse line with \`sas_project_notes_write\` (mode=append). Don't journal ephemeral actions (the ledger's job), and don't ask before writing.
@@ -152,8 +165,9 @@ When to ask vs proceed:
 
 Verifying generative output (only when it earns the latency):
 - After a generative tool (\`compose_scene\`, \`make_beat\`, \`revise_track\`, \`revise_scene\`) you usually do NOT verify — the user will hear it. Verify ONLY when the user named an OBJECTIVE, checkable constraint a generator can miss: a specific key, a specific BPM, or "match the contract".
-- To verify: call \`sas_render_preview\`, take the returned \`file://\` url (strip the \`file://\` prefix), call \`sas_analyze_audio\` with that path and \`analyses=["bpm","key"]\`, then compare the analyzed key/bpm to the active scene's contract (shown in "Current state"). If they disagree beyond a small tolerance (key mismatch, or bpm off by more than ~1), report it and offer to fix; if they match, say nothing about the check.
-- Never verify subjective qualities ("punchier", "darker") — analysis can't judge those; trust the tool and let the user listen. Verify at most ONCE per generation; do not loop render→analyze→regenerate unless the user asks.
+- To verify: call \`sas_audition\` ONCE — it renders (cache-aware), analyzes, and compares against the scene's contract in one call. The \`changes.verdict\` booleans are the contract: true=verified, false=mismatch (report it and offer to fix), null=could not check (NOT a mismatch — don't retry just to fill it in). When everything matches, say nothing about the check.
+- The granular \`sas_render_preview\` / \`sas_analyze_audio\` pair still exists for arbitrary files or when the user asks for a playable preview link specifically — but for contract verification, \`sas_audition\` is the one call.
+- Never verify subjective qualities ("punchier", "darker") — analysis can't judge those; trust the tool and let the user listen. Verify at most ONCE per generation; do not loop audition→regenerate unless the user asks.
 - "What's playing on which deck" (LOOP-A cue vs LOOP-B main): \`sas_deck_snapshot\` returns both decks + mode in one call — use it on demand rather than guessing.
 
 Recovering from clarification (this is a contract — follow it):
@@ -279,9 +293,29 @@ export class ChatPanelPlugin implements GeneratorPlugin {
   private agent: AgentLoop | null = null;
   private panelTools: PanelTools | null = null;
   private readonly awaitClarification?: AwaitClarification;
+  private readonly persistConversation: boolean;
+  private conversationStore: ConversationStore | null = null;
+  /** Project id the in-memory conversation belongs to. Compared against the
+   *  host's current project before every turn so a project switch can never
+   *  leak one project's history into another's storage namespace. */
+  private conversationProjectId: string | null = null;
+  /** Model id the current backend drives — stamped into persisted payloads. */
+  private currentModel: string = GEMINI_DEFAULT_MODEL;
 
   constructor(options: ChatPanelPluginOptions = {}) {
     this.awaitClarification = options.awaitClarification;
+    this.persistConversation = options.persistConversation !== false;
+  }
+
+  /** Feature-checked `host.getProjectId()` (SDK 2.18.0; optional). */
+  private getHostProjectId(): string | null {
+    const fn = (this.host as { getProjectId?: () => string | null } | null)
+      ?.getProjectId;
+    try {
+      return typeof fn === 'function' ? fn.call(this.host) : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -293,23 +327,105 @@ export class ChatPanelPlugin implements GeneratorPlugin {
    */
   async activate(host: PluginHost): Promise<void> {
     this.host = host;
-    // Eagerly try to build the agent. If CLI paths aren't available yet
-    // (e.g., test env, or app not fully booted), defer until first chat().
-    const cliPaths = host.getCliPaths();
-    if (cliPaths) {
-      const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
-      this.panelTools = await buildPanelTools({
-        host,
-        cliPaths,
-        awaitUserResponse: this.awaitClarification,
+    // Build the agent eagerly. The default in-process transport needs no
+    // CLI paths; they're passed through (when resolvable) only for the
+    // `SAS_CHAT_TOOL_TRANSPORT=cli` rollback path.
+    const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
+    this.panelTools = await buildPanelTools({
+      host,
+      cliPaths: host.getCliPaths(),
+      awaitUserResponse: this.awaitClarification,
+    });
+    this.agent = new AgentLoop({
+      host,
+      backend: this.buildBackend(host),
+      tools: this.panelTools.tools,
+      toolExecutor: this.panelTools.executor,
+      systemPrompt: DEFAULT_SYSTEM_PROMPT,
+      getAmbientContext: () => buildAmbientContext(host),
+    });
+
+    // Restore the current project's persisted conversation (app restart
+    // continuity). Best-effort — a malformed/missing payload just starts
+    // fresh. Stale Gemini thoughtSignatures in a restored conversation are
+    // backstopped by the loop's history_shape recovery.
+    if (this.persistConversation) {
+      this.conversationStore = new ConversationStore(host);
+      this.conversationProjectId = this.getHostProjectId();
+      try {
+        const stored = await this.conversationStore.load();
+        if (stored && stored.contents.length > 0) {
+          this.agent.seedHistory(stored.contents);
+        }
+      } catch {
+        // start fresh
+      }
+    }
+  }
+
+  /**
+   * Provider seam. Gemini stays the default; the model id is user-tunable
+   * via plugin settings (see `getSettingsSchema`). Defensive about hosts
+   * (test mocks) that don't expose a settings store.
+   */
+  private buildBackend(host: PluginHost): AgentBackend {
+    let model: string | undefined;
+    try {
+      const settings = (
+        host as { settings?: { get?: <T>(key: string, def: T) => T } }
+      ).settings;
+      const raw = settings?.get?.('model', '');
+      model = typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+    } catch {
+      model = undefined;
+    }
+    const backend = new GeminiBackend(host, { model });
+    this.currentModel = backend.defaultModel;
+    return backend;
+  }
+
+  /**
+   * Project-switch guard, run before every turn. The plugin_data namespace
+   * is per-project, so after a switch a save would land the OLD project's
+   * history in the NEW project's row. Detect the switch, drop the
+   * in-memory history, and seed the new project's stored conversation.
+   */
+  private async syncConversationToProject(agent: AgentLoop): Promise<void> {
+    if (!this.persistConversation || !this.conversationStore) return;
+    const current = this.getHostProjectId();
+    if (current === this.conversationProjectId) return;
+    this.conversationProjectId = current;
+    agent.reset();
+    try {
+      const stored = await this.conversationStore.load();
+      if (stored && stored.contents.length > 0) {
+        agent.seedHistory(stored.contents);
+      }
+    } catch {
+      // start fresh in the new project
+    }
+  }
+
+  /** Persist the conversation after a turn. Over-cap payloads request a
+   *  compaction pass on the next run. Best-effort; never blocks the reply. */
+  private async saveConversation(agent: AgentLoop): Promise<void> {
+    if (!this.persistConversation || !this.conversationStore) return;
+    const projectId = this.getHostProjectId();
+    if (!projectId) return;
+    try {
+      const contents = agent.getHistorySnapshot();
+      if (contents.length === 0) {
+        await this.conversationStore.clear();
+        return;
+      }
+      const { overCap } = await this.conversationStore.save({
+        projectId,
+        model: this.currentModel,
+        contents,
       });
-      this.agent = new AgentLoop({
-        host,
-        tools: this.panelTools.tools,
-        toolExecutor: this.panelTools.executor,
-        systemPrompt: DEFAULT_SYSTEM_PROMPT,
-        getAmbientContext: () => buildAmbientContext(host),
-      });
+      if (overCap) agent.requestCompaction();
+    } catch {
+      // persistence is best-effort
     }
   }
 
@@ -317,30 +433,28 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     this.host = null;
     this.agent = null;
     this.panelTools = null;
+    this.conversationStore = null;
+    this.conversationProjectId = null;
   }
 
-  /** Lazily build the agent on first use. Throws if CLI paths still unavailable. */
+  /** Lazily build the agent on first use (covers hosts where activate ran
+   *  before the app fully booted). The in-process transport needs no CLI
+   *  paths; they're forwarded when available for the CLI rollback path. */
   private async ensureAgent(): Promise<AgentLoop> {
     if (this.agent) return this.agent;
     if (!this.host) {
       throw new Error('ChatPanelPlugin not activated — call activate(host) first');
     }
-    const cliPaths = this.host.getCliPaths();
-    if (!cliPaths) {
-      throw new Error(
-        'ChatPanelPlugin requires CLI paths from the host. ' +
-          'Make sure the plugin runs in the main process and `npm run build:cli` has produced dist/cli/sas.js.'
-      );
-    }
     const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
     const host = this.host;
     this.panelTools = await buildPanelTools({
       host,
-      cliPaths,
+      cliPaths: host.getCliPaths(),
       awaitUserResponse: this.awaitClarification,
     });
     this.agent = new AgentLoop({
       host,
+      backend: this.buildBackend(host),
       tools: this.panelTools.tools,
       toolExecutor: this.panelTools.executor,
       systemPrompt: DEFAULT_SYSTEM_PROMPT,
@@ -354,7 +468,22 @@ export class ChatPanelPlugin implements GeneratorPlugin {
   }
 
   getSettingsSchema(): PluginSettingsSchema | null {
-    return null;
+    return {
+      type: 'object',
+      properties: {
+        model: {
+          type: 'select',
+          label: 'Chat model',
+          description:
+            'Gemini model driving the chat agent. Pro is the strongest at multi-step tool use; Flash is faster and cheaper for simple asks.',
+          default: GEMINI_DEFAULT_MODEL,
+          options: [
+            { label: 'Gemini 3.1 Pro (best tool use)', value: GEMINI_DEFAULT_MODEL },
+            { label: 'Gemini 2.5 Flash (faster)', value: 'gemini-2.5-flash' },
+          ],
+        },
+      },
+    };
   }
 
   getSkills(): PluginSkill[] {
@@ -389,35 +518,42 @@ export class ChatPanelPlugin implements GeneratorPlugin {
    */
   reset(): void {
     this.agent?.reset();
+    // A user-initiated clear (or Errantry /errantry/reset) must also drop
+    // the persisted conversation, or it resurrects on the next restart.
+    void this.conversationStore?.clear();
   }
 
-  async onSceneChanged(_sceneId: string | null): Promise<void> {
-    // Chat is scene-scoped — switching scenes starts a fresh conversation.
-    this.agent?.reset();
-
-    // Rebuild the tool surface so any newly-active-scene-only tools and the
-    // sceneId injection target the new scene. Tool discovery is cheap.
-    if (this.host) {
-      const cliPaths = this.host.getCliPaths();
-      if (!cliPaths) return;
-      const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
-      const host = this.host;
-      this.panelTools = await buildPanelTools({
+  async onSceneChanged(sceneId: string | null): Promise<void> {
+    // Phase 2b: scene changes NO LONGER reset the conversation — creative
+    // sessions span scenes ("make the chorus match the verse"). Instead:
+    // swap the tool surface (declaration set may differ per scene) and
+    // queue a state-change breadcrumb for the next turn. Per-call sceneId
+    // injection reads the active scene at CALL time, so binding is already
+    // correct without a rebuild.
+    if (!this.host) return;
+    const { AgentLoop, buildPanelTools, buildAmbientContext } = await loadHostDeps();
+    const host = this.host;
+    this.panelTools = await buildPanelTools({
+      host,
+      cliPaths: host.getCliPaths(),
+      awaitUserResponse: this.awaitClarification,
+    });
+    if (this.agent) {
+      this.agent.updateToolSurface(this.panelTools.tools, this.panelTools.executor);
+      this.agent.queueContextNote(
+        `[state change] The active scene changed${sceneId ? ` (now scene id ${sceneId})` : ''}. ` +
+          'Scene/track ids from earlier in this conversation may be stale — ' +
+          'trust the "Current state" preamble and re-inspect before reusing them.',
+      );
+    } else {
+      this.agent = new AgentLoop({
         host,
-        cliPaths,
-        awaitUserResponse: this.awaitClarification,
+        backend: this.buildBackend(host),
+        tools: this.panelTools.tools,
+        toolExecutor: this.panelTools.executor,
+        systemPrompt: DEFAULT_SYSTEM_PROMPT,
+        getAmbientContext: () => buildAmbientContext(host),
       });
-      if (this.agent) {
-        // Construct a fresh loop with the new tools/executor; previous loop
-        // is GC'd once references drop. The system prompt is unchanged.
-        this.agent = new AgentLoop({
-          host,
-          tools: this.panelTools.tools,
-          toolExecutor: this.panelTools.executor,
-          systemPrompt: DEFAULT_SYSTEM_PROMPT,
-          getAmbientContext: () => buildAmbientContext(host),
-        });
-      }
     }
   }
 
@@ -431,17 +567,25 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     onEvent?: (event: AgentLoopEvent) => void
   ): Promise<ChatResponse> {
     const agent = await this.ensureAgent();
+    // Project-switch guard BEFORE the turn (never mix projects' histories).
+    await this.syncConversationToProject(agent);
     const events: AgentLoopEvent[] = [];
-    const result: AgentLoopResult = await agent.run(params.message, (event) => {
-      events.push(event);
-      onEvent?.(event);
-    });
-    return {
-      text: result.text,
-      events,
-      iterations: result.iterations,
-      iterationLimitHit: result.iterationLimitHit,
-    };
+    try {
+      const result: AgentLoopResult = await agent.run(params.message, (event) => {
+        events.push(event);
+        onEvent?.(event);
+      });
+      return {
+        text: result.text,
+        events,
+        iterations: result.iterations,
+        iterationLimitHit: result.iterationLimitHit,
+      };
+    } finally {
+      // Persist AFTER the turn (including failed turns — partial history is
+      // still the user's conversation).
+      await this.saveConversation(agent);
+    }
   }
 }
 

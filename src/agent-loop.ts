@@ -20,6 +20,9 @@ import type {
   LLMTool,
   LLMToolUseRequest,
 } from '@signalsandsorcery/plugin-sdk';
+import { BackendError, type AgentBackend } from './backend';
+import { GeminiBackend } from './gemini-backend';
+import { ASK_USER_TOOL_NAME } from './constants';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -168,6 +171,15 @@ export type AgentLoopEvent =
       items: WorkflowProgressItem[];
     }
   | { type: 'iteration_limit'; iterations: number }
+  | {
+      /**
+       * The user approved continuing past the iteration budget (structural
+       * continue-confirmation, Phase 2c). `newLimit` is the raised cap.
+       */
+      type: 'iterations_extended';
+      iterations: number;
+      newLimit: number;
+    }
   | { type: 'final_text'; iterations: number; text: string };
 
 export type AgentLoopEventHandler = (event: AgentLoopEvent) => void;
@@ -180,10 +192,16 @@ export interface AgentLoopOptions {
   toolExecutor: ToolExecutor;
   /** System instruction text. */
   systemPrompt: string;
-  /** Gemini model id. Default: 'gemini-3.1-pro-preview' — Google's flagship
-   *  agentic-tool-use model (Feb 2026). Leads MCP-Atlas (69.2%) and APEX-Agents
-   *  (33.5%) for multi-MCP tool coordination. Older 2.5-pro is materially
-   *  weaker at recovering from structured tool errors. */
+  /**
+   * Provider seam. When omitted, a `GeminiBackend` is constructed over
+   * `options.host` — the historical behavior. The loop keys its recovery
+   * policy on `BackendError.kind`, never on provider error text.
+   */
+  backend?: AgentBackend;
+  /** Model id. Default: the backend's `defaultModel` ('gemini-3.1-pro-preview'
+   *  for the default GeminiBackend — Google's flagship agentic-tool-use model,
+   *  Feb 2026; older 2.5-pro is materially weaker at recovering from
+   *  structured tool errors). */
   model?: string;
   /** Iteration cap. Default: 25. Older default of 10 frequently exhausted on
    *  composite intents (compose_scene → tweak → preview); 25 leaves headroom
@@ -216,7 +234,25 @@ export interface AgentLoopResult {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_ITERATIONS = 25;
-const DEFAULT_MODEL = 'gemini-3.1-pro-preview';
+/** Iterations granted per user-approved extension at the budget cap. */
+export const ITERATION_EXTENSION_STEP = 15;
+/** Max number of user-approved extensions per turn. */
+export const MAX_ITERATION_EXTENSIONS = 3;
+/** Absolute per-turn iteration ceiling regardless of approvals. */
+export const HARD_ITERATION_CEILING = 70;
+const CONTINUE_OPTION = 'Keep going';
+const STOP_OPTION = 'Stop and summarize';
+
+/** Interpret the user's reply to the continue-at-cap question. Exported for
+ *  tests. Quick-reply clicks return the option string verbatim; typed
+ *  answers get a conservative affirmative check. */
+export function isAffirmativeContinue(response: string): boolean {
+  const t = (response ?? '').trim().toLowerCase();
+  if (t.length === 0) return false;
+  if (t.startsWith('keep')) return true;
+  if (t.startsWith('continue')) return true;
+  return ['y', 'yes', 'yes please', 'sure', 'ok', 'okay', 'go', 'go on', 'go ahead', 'proceed'].includes(t);
+}
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -253,11 +289,18 @@ const DEFAULT_MODEL = 'gemini-3.1-pro-preview';
  */
 export class AgentLoop {
   private readonly host: PluginHost;
-  private readonly tools: LLMTool[];
-  private readonly toolExecutor: ToolExecutor;
+  private readonly backend: AgentBackend;
+  /** Mutable: `updateToolSurface()` swaps these on scene change without
+   *  dropping conversation history. Deferred while a run is in flight. */
+  private tools: LLMTool[];
+  private toolExecutor: ToolExecutor;
   private readonly systemPrompt: string;
   private readonly model: string;
   private readonly maxIterations: number;
+  /** Prompt-token count reported by the most recent completion. Drives the
+   *  start-of-turn compaction trigger (Phase 2b). `null` until the first
+   *  completion of the session reports usage. */
+  private lastPromptTokens: number | null = null;
   private readonly onEvent?: AgentLoopEventHandler;
   private readonly getAmbientContext?: () => Promise<string>;
   /** Ambient context fetched once at the start of each `run()` and reused
@@ -278,27 +321,98 @@ export class AgentLoop {
   private isRunning = false;
   /** A reset() request that arrived while running; applied at run end. */
   private pendingReset = false;
+  /** A tool-surface swap that arrived while running; applied at run end. */
+  private pendingToolSurface: { tools: LLMTool[]; executor: ToolExecutor } | null = null;
+  /** Context notes (scene-switch breadcrumbs etc.) prepended to the NEXT
+   *  user message. Notes never splice into existing history — that would
+   *  risk the Gemini turn-shape rules; prepending to a fresh user turn is
+   *  always safe. */
+  private pendingContextNotes: string[] = [];
+  /** Force a compaction pass at the start of the next run regardless of
+   *  thresholds (set when the persisted conversation exceeds its size cap). */
+  private forceCompactRequested = false;
 
   constructor(options: AgentLoopOptions) {
     this.host = options.host;
+    this.backend =
+      options.backend ??
+      new GeminiBackend(options.host, { model: options.model });
     this.tools = options.tools;
     this.toolExecutor = options.toolExecutor;
     this.systemPrompt = options.systemPrompt;
-    this.model = options.model ?? DEFAULT_MODEL;
+    this.model = options.model ?? this.backend.defaultModel;
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     this.onEvent = options.onEvent;
     this.getAmbientContext = options.getAmbientContext;
   }
 
-  /** Drop conversation history (called on scene change). Defers if a run is
-   *  in flight so we don't tear out [user, model(toolCall)] state while a
-   *  toolExecutor is awaiting — see `isRunning` field comment. */
+  /** Drop conversation history (user "clear", project switch, Errantry
+   *  reset). Defers if a run is in flight so we don't tear out
+   *  [user, model(toolCall)] state while a toolExecutor is awaiting — see
+   *  `isRunning` field comment. NOTE: scene changes no longer reset — they
+   *  flow through `updateToolSurface` + `queueContextNote` (Phase 2b). */
   reset(): void {
     if (this.isRunning) {
       this.pendingReset = true;
       return;
     }
     this.contents = [];
+  }
+
+  /**
+   * Seed conversation history from a persisted snapshot (app restart
+   * restore). Ignored while a run is in flight — seeding mid-run could
+   * corrupt the turn shape. Entries are minimally validated; garbage in
+   * the store must never wedge the loop.
+   */
+  seedHistory(contents: LLMContent[]): void {
+    if (this.isRunning) return;
+    if (!Array.isArray(contents)) return;
+    const valid = contents.filter(
+      (c) =>
+        c !== null &&
+        typeof c === 'object' &&
+        (c.role === 'user' || c.role === 'model') &&
+        Array.isArray(c.parts),
+    );
+    this.contents = valid;
+  }
+
+  /** Deep-ish copy of the conversation for persistence. JSON round-trip
+   *  keeps opaque fields (thoughtSignature) intact and guarantees the
+   *  caller can't mutate live history. */
+  getHistorySnapshot(): LLMContent[] {
+    return JSON.parse(JSON.stringify(this.contents)) as LLMContent[];
+  }
+
+  /**
+   * Swap the tool declarations + executor (scene change rebuilt the panel
+   * surface) WITHOUT dropping conversation history. Deferred while a run
+   * is in flight — declarations are rebuilt per request, so the new
+   * surface takes effect on the next LLM call after application.
+   */
+  updateToolSurface(tools: LLMTool[], executor: ToolExecutor): void {
+    if (this.isRunning) {
+      this.pendingToolSurface = { tools, executor };
+      return;
+    }
+    this.tools = tools;
+    this.toolExecutor = executor;
+  }
+
+  /**
+   * Queue a one-shot context note (e.g. "[state change] Active scene
+   * switched …"). Prepended to the NEXT user message, then cleared.
+   */
+  queueContextNote(note: string): void {
+    const trimmed = typeof note === 'string' ? note.trim() : '';
+    if (trimmed.length > 0) this.pendingContextNotes.push(trimmed);
+  }
+
+  /** Force a compaction pass at the start of the next run (e.g. the
+   *  persisted conversation exceeded its size cap). */
+  requestCompaction(): void {
+    this.forceCompactRequested = true;
   }
 
   /**
@@ -338,6 +452,11 @@ export class AgentLoop {
         this.pendingReset = false;
         this.contents = [];
       }
+      if (this.pendingToolSurface) {
+        this.tools = this.pendingToolSurface.tools;
+        this.toolExecutor = this.pendingToolSurface.executor;
+        this.pendingToolSurface = null;
+      }
     }
   }
 
@@ -358,9 +477,22 @@ export class AgentLoop {
       }
     }
 
+    // Start-of-turn compaction: between turns is the ONLY safe place to do
+    // history surgery (no in-flight functionCall/functionResponse pairing).
+    await this.maybeCompact();
+
+    // One-shot context notes (scene-switch breadcrumbs) ride the front of
+    // this user turn — prepending to a fresh user message never violates
+    // the provider's turn-shape rules, unlike splicing into history.
+    let effectiveMessage = userMessage;
+    if (this.pendingContextNotes.length > 0) {
+      effectiveMessage = `${this.pendingContextNotes.join('\n')}\n\n${userMessage}`;
+      this.pendingContextNotes = [];
+    }
+
     this.contents.push({
       role: 'user',
-      parts: [{ text: userMessage }],
+      parts: [{ text: effectiveMessage }],
     });
 
     let iteration = 0;
@@ -373,7 +505,14 @@ export class AgentLoop {
      *  diagnostic to the user). */
     let emptyRetriesUsed = 0;
     const MAX_EMPTY_RETRIES = 1;
-    while (iteration < this.maxIterations) {
+    // Iteration budget with structural continue-confirmation (Phase 2c):
+    // at the cap, the user is asked (via the ask_user transport) whether to
+    // keep going; each approval grants ITERATION_EXTENSION_STEP more, up to
+    // MAX_ITERATION_EXTENSIONS times / HARD_ITERATION_CEILING total.
+    let effectiveMax = this.maxIterations;
+    let extensionsGranted = 0;
+    budget: for (;;) {
+    while (iteration < effectiveMax) {
       iteration++;
 
       const sysText =
@@ -393,22 +532,25 @@ export class AgentLoop {
       emit({ type: 'llm_call_start', iteration });
       try {
         try {
-          response = await this.host.generateWithLLMTools(request);
+          response = await this.backend.complete(request);
         } catch (err) {
-          // Gemini sometimes rejects an otherwise-valid conversation with the
-          // 400 "function response turn comes immediately after a function
-          // call turn" error after a long sequence of failed tool calls.
+          // The backend classifies provider failures into structural kinds
+          // (BackendError.kind) — the loop's recovery policy keys on those,
+          // never on provider error text.
+          //
+          // 'history_shape': the provider rejected the conversation's shape
+          // (Gemini's 400 "function response turn comes immediately after a
+          // function call turn" after a long sequence of failed tool calls,
+          // or a stale thoughtSignature on a restored conversation).
           // Best-effort recovery: drop everything except the most recent
           // user message and retry once. If the retry also fails, surface
           // the error to the user.
-          const message = err instanceof Error ? err.message : String(err);
           const isShapeError =
-            message.includes('400') &&
-            message.toLowerCase().includes('function response');
+            err instanceof BackendError && err.kind === 'history_shape';
           if (isShapeError && iteration === 1 && this.contents.length > 1) {
             const lastUser = this.contents[this.contents.length - 1];
             this.contents = lastUser ? [lastUser] : [];
-            response = await this.host.generateWithLLMTools({
+            response = await this.backend.complete({
               ...request,
               contents: [...this.contents],
             });
@@ -418,8 +560,12 @@ export class AgentLoop {
         }
       } finally {
         // Always pair llm_call_end with llm_call_start so the UI can clear
-        // its "thinking" indicator even when generateWithLLMTools throws.
+        // its "thinking" indicator even when the backend throws.
         emit({ type: 'llm_call_end', iteration });
+      }
+      // Track context pressure for the start-of-turn compaction trigger.
+      if (typeof response.usageMetadata?.promptTokenCount === 'number') {
+        this.lastPromptTokens = response.usageMetadata.promptTokenCount;
       }
       const candidate = response.candidates[0];
       if (!candidate) {
@@ -566,14 +712,230 @@ export class AgentLoop {
       });
     }
 
+    // Budget exhausted mid-task. Ask the user (through the same ask_user
+    // transport the model uses) whether to keep going. Decline, a missing
+    // transport, or hitting the extension limits falls through to the
+    // iteration_limit path below.
+    if (
+      extensionsGranted >= MAX_ITERATION_EXTENSIONS ||
+      effectiveMax >= HARD_ITERATION_CEILING
+    ) {
+      break budget;
+    }
+    const approved = await this.confirmContinueAtCap(iteration);
+    if (!approved) break budget;
+    extensionsGranted++;
+    effectiveMax = Math.min(
+      effectiveMax + ITERATION_EXTENSION_STEP,
+      HARD_ITERATION_CEILING,
+    );
+    emit({ type: 'iterations_extended', iterations: iteration, newLimit: effectiveMax });
+    }
+
     // Iteration cap — bail with a clear message rather than looping forever.
     const cap =
-      `I hit my iteration limit (${this.maxIterations}). ` +
+      `I hit my iteration limit (${effectiveMax}). ` +
       `Tell me how you'd like to continue, or try a smaller subgoal.`;
     emit({ type: 'iteration_limit', iterations: iteration });
     emit({ type: 'final_text', iterations: iteration, text: cap });
     return { text: cap, iterations: iteration, iterationLimitHit: true };
   }
+
+  /**
+   * Ask the user whether to continue past the iteration budget, through the
+   * SAME ask_user transport the model uses (so the question renders as a
+   * quick-reply card in the chat UI). A missing transport (the executor
+   * returns the structured "not available" failure) or any throw counts as
+   * a decline — never block the turn on a question nobody can answer.
+   */
+  private async confirmContinueAtCap(iteration: number): Promise<boolean> {
+    try {
+      const result = await this.toolExecutor(ASK_USER_TOOL_NAME, {
+        question:
+          `I've used my step budget (${iteration} steps) and the task isn't finished. ` +
+          'Keep going?',
+        options: [CONTINUE_OPTION, STOP_OPTION],
+      });
+      if (!result.success) return false;
+      return isAffirmativeContinue(result.stdout);
+    } catch {
+      return false;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Compaction (Phase 2b)
+  //
+  // Long-lived conversations (persistence + scene-switch continuity) need a
+  // summarize-don't-wipe pressure valve. Triggered at the START of a run —
+  // the only point with no in-flight functionCall/functionResponse pairing —
+  // when the last completion reported high prompt-token pressure, the entry
+  // count is large, or a caller forced it (persisted payload over its size
+  // cap). The prefix is summarized by the backend's cheap compaction model;
+  // the kept window starts at the LAST REAL USER MESSAGE so every
+  // functionCall/functionResponse pair (and Gemini-3 thoughtSignature) in
+  // the window survives byte-identical. Summarizer failure → proceed
+  // uncompacted; compaction is an optimization, never a blocker.
+  // -------------------------------------------------------------------------
+
+  private async maybeCompact(): Promise<void> {
+    const due =
+      this.forceCompactRequested ||
+      (this.lastPromptTokens !== null &&
+        this.lastPromptTokens > COMPACT_PROMPT_TOKEN_THRESHOLD) ||
+      this.contents.length > COMPACT_ENTRY_THRESHOLD;
+    if (!due) return;
+
+    const cut = findCompactionCut(this.contents);
+    if (cut <= 0) {
+      // Nothing summarizable (history empty / starts at the only real user
+      // message). Clear the force flag so we don't retry every turn.
+      this.forceCompactRequested = false;
+      return;
+    }
+
+    const prefix = this.contents.slice(0, cut);
+    const keptWindow = this.contents.slice(cut);
+    try {
+      const summary = await this.summarizeForCompaction(prefix);
+      if (!summary) return;
+      this.contents = [
+        {
+          role: 'user',
+          parts: [
+            {
+              text:
+                `[Conversation summary — ${prefix.length} earlier entries compacted. ` +
+                `Treat this as ground truth for what happened before:]\n${summary}`,
+            },
+          ],
+        },
+        // Model ack keeps user/model alternation clean ahead of the kept
+        // window (which starts with a real user message).
+        { role: 'model', parts: [{ text: 'Understood — continuing from that summary.' }] },
+        ...keptWindow,
+      ];
+      this.forceCompactRequested = false;
+      // Token pressure is materially reduced; clear so we don't re-trigger
+      // until the next completion reports fresh usage.
+      this.lastPromptTokens = null;
+    } catch {
+      // Summarizer failure → proceed with the uncompacted conversation.
+    }
+  }
+
+  /** One tool-free completion on the backend's cheap model. Returns null on
+   *  empty output. Throws propagate to maybeCompact's catch. */
+  private async summarizeForCompaction(prefix: LLMContent[]): Promise<string | null> {
+    const transcript = renderTranscriptForCompaction(prefix);
+    const response = await this.backend.complete({
+      model: this.backend.compactionModel,
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: `${COMPACTION_PROMPT}\n\n--- TRANSCRIPT ---\n${transcript}` }],
+        },
+      ],
+      toolConfig: { functionCallingConfig: { mode: 'NONE' } },
+      generationConfig: { maxOutputTokens: COMPACTION_MAX_OUTPUT_TOKENS, temperature: 0.2 },
+    });
+    const parts = response.candidates[0]?.content.parts ?? [];
+    const text = parts
+      .filter(hasText)
+      .map((p) => p.text)
+      .join('\n')
+      .trim();
+    return text.length > 0 ? text : null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Compaction constants + pure helpers (exported for unit tests)
+// ---------------------------------------------------------------------------
+
+/** Prompt-token pressure (from the provider's own usage report) above which
+ *  the next turn compacts. Well under Gemini's context limit — compaction
+ *  should land long before requests start failing. */
+const COMPACT_PROMPT_TOKEN_THRESHOLD = 60_000;
+/** Entry-count fallback for hosts/providers that don't report usage. */
+const COMPACT_ENTRY_THRESHOLD = 80;
+/** Cap on the summary the compaction model may produce. */
+const COMPACTION_MAX_OUTPUT_TOKENS = 1_200;
+/** Cap on the serialized transcript fed to the summarizer (tail-sliced). */
+const COMPACTION_TRANSCRIPT_CAP = 24_000;
+
+const COMPACTION_PROMPT =
+  'Summarize this assistant-session transcript for the assistant itself to resume from. ' +
+  'PRESERVE: (1) user feedback and stated preferences — quote short phrases verbatim; ' +
+  '(2) concrete parameter values and entity ids that were used (scene/track names and ids, BPM, keys, chord progressions); ' +
+  '(3) decisions made and approaches that failed (so they are not retried); ' +
+  '(4) open goals / unfinished work. ' +
+  'OMIT pleasantries and tool-call mechanics. Write tight bullet points, no preamble.';
+
+/**
+ * Find the index of the LAST "real" user message — a user turn with text and
+ * no functionResponse parts. Cutting there keeps the current task's full
+ * turn (every functionCall/functionResponse pair intact, thoughtSignatures
+ * byte-identical) and summarizes everything before it. Returns 0 when no
+ * cut is useful (empty history, or the only real user message starts it).
+ */
+export function findCompactionCut(contents: LLMContent[]): number {
+  for (let i = contents.length - 1; i > 0; i--) {
+    const entry = contents[i];
+    if (entry.role !== 'user') continue;
+    const parts = entry.parts ?? [];
+    const hasFunctionResponse = parts.some(
+      (p) => (p as { functionResponse?: unknown }).functionResponse !== undefined,
+    );
+    const hasTextPart = parts.some(
+      (p) => typeof (p as { text?: unknown }).text === 'string',
+    );
+    if (!hasFunctionResponse && hasTextPart) return i;
+  }
+  return 0;
+}
+
+/** Render history entries as a compact text transcript for the summarizer.
+ *  Tool calls/results are abbreviated — the summary needs outcomes, not
+ *  payloads. Tail-sliced to `COMPACTION_TRANSCRIPT_CAP` chars. */
+export function renderTranscriptForCompaction(contents: LLMContent[]): string {
+  const lines: string[] = [];
+  for (const entry of contents) {
+    for (const part of entry.parts ?? []) {
+      const p = part as {
+        text?: string;
+        functionCall?: { name: string; args: Record<string, unknown> };
+        functionResponse?: { name: string; response?: Record<string, unknown> };
+      };
+      if (typeof p.text === 'string' && p.text.length > 0) {
+        lines.push(`${entry.role}: ${p.text}`);
+      } else if (p.functionCall) {
+        let args = '';
+        try {
+          args = JSON.stringify(p.functionCall.args).slice(0, 200);
+        } catch {
+          args = '<unserializable>';
+        }
+        lines.push(`${entry.role} → tool ${p.functionCall.name}(${args})`);
+      } else if (p.functionResponse) {
+        const resp = p.functionResponse.response ?? {};
+        const ok = (resp as { success?: unknown }).success === true;
+        let detail = '';
+        try {
+          detail = JSON.stringify(resp).slice(0, 200);
+        } catch {
+          detail = '';
+        }
+        lines.push(
+          `tool ${p.functionResponse.name} ← ${ok ? 'OK' : 'FAILED'} ${detail}`,
+        );
+      }
+    }
+  }
+  const joined = lines.join('\n');
+  return joined.length <= COMPACTION_TRANSCRIPT_CAP
+    ? joined
+    : joined.slice(-COMPACTION_TRANSCRIPT_CAP);
 }
 
 // ---------------------------------------------------------------------------

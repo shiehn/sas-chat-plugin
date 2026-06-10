@@ -4,15 +4,20 @@
  *
  * Two outputs:
  *   - `tools`: the LLM-facing `LLMTool[]` (Gemini `functionDeclarations`
- *     shape) handed to `host.generateWithLLMTools`.
- *   - `executor`: a `ToolExecutor` that maps each function call to a
- *     subprocess invocation of the `sas` CLI.
+ *     shape) handed to the agent backend.
+ *   - `executor`: a `ToolExecutor` that dispatches each function call.
  *
- * Tool discovery still goes through `host.listAppTools({ scope: 'scene' })`
- * — that gives us the same authoritative list the CLI exposes. Execution
- * goes through the CLI subprocess so the chat plugin gets the same agent-
- * legibility surface (stderr remediation, prerequisite chains, exit codes)
- * external agents like Claude Code see at the terminal.
+ * Tool discovery goes through `host.listAppTools({ scope: 'scene' })` —
+ * the same authoritative list the CLI exposes.
+ *
+ * Execution transport (Phase 2a):
+ *   - `'in-process'` (default): `host.executeAppTool(name, params,
+ *     { provenance: 'agent' })` → ToolRegistry directly. Saves the
+ *     ~300–800 ms `sas` CLI subprocess spawn per call; the full
+ *     OperationResult (remediation, clarification, nextSteps) rides on
+ *     `res.data`, so the model sees the SAME envelope the CLI prints.
+ *   - `'cli'`: the historical `sas` subprocess path. Rollback switch:
+ *     set `SAS_CHAT_TOOL_TRANSPORT=cli` (or pass `transport: 'cli'`).
  */
 
 import type {
@@ -23,9 +28,13 @@ import type {
 } from '@signalsandsorcery/plugin-sdk';
 import { invokeSas } from './sas-tool-handler';
 import type { AgentNextStep, ToolExecutor, ToolExecutionResult } from './agent-loop';
-import { ASK_USER_TOOL_NAME, CHAT_TASK_LEDGER_TOOL_NAME } from './constants';
+import {
+  ASK_USER_TOOL_NAME,
+  CHAT_TASK_LEDGER_TOOL_NAME,
+  PRODUCER_PREFERENCES_TOOL_NAME,
+} from './constants';
 
-export { ASK_USER_TOOL_NAME, CHAT_TASK_LEDGER_TOOL_NAME };
+export { ASK_USER_TOOL_NAME, CHAT_TASK_LEDGER_TOOL_NAME, PRODUCER_PREFERENCES_TOOL_NAME };
 
 export interface PanelTools {
   /** LLM-facing tool declarations (single `LLMTool` wrapping all functions). */
@@ -50,8 +59,12 @@ export type AwaitUserResponse = (
 
 export interface BuildPanelToolsOptions {
   host: PluginHost;
-  /** Paths for spawning the `sas` CLI. From `host.getCliPaths()` typically. */
-  cliPaths: { appExe: string; cliEntry: string };
+  /**
+   * Paths for spawning the `sas` CLI. From `host.getCliPaths()` typically.
+   * Only required for the `'cli'` transport — the default in-process
+   * transport never spawns a subprocess.
+   */
+  cliPaths?: { appExe: string; cliEntry: string } | null;
   /**
    * When provided, registers the synthetic `ask_user` tool the LLM can
    * call mid-loop to surface a focused clarifying question to the user.
@@ -60,6 +73,35 @@ export interface BuildPanelToolsOptions {
    * entirely (the LLM falls back to plain-text responses).
    */
   awaitUserResponse?: AwaitUserResponse;
+  /**
+   * Tool-execution transport. Default resolution order: this option →
+   * `SAS_CHAT_TOOL_TRANSPORT` env var → `'in-process'`.
+   */
+  transport?: 'in-process' | 'cli';
+  /**
+   * Watchdog for in-process calls. A handler that never settles would
+   * otherwise wedge the agent loop forever (the CLI path had a subprocess
+   * timeout; this is its in-process equivalent). The underlying handler
+   * keeps running detached — if it eventually mutates, the mutation
+   * broadcast + next turn's ambient refresh surface the change.
+   * Default 300 000 ms (matches the CLI timeout). Test seam.
+   */
+  inProcessTimeoutMs?: number;
+}
+
+/** Default watchdog for in-process tool calls — mirrors the CLI's 300 s. */
+const DEFAULT_IN_PROCESS_TIMEOUT_MS = 300_000;
+
+/** Resolve the effective transport from option + env. */
+function resolveTransport(
+  explicit: 'in-process' | 'cli' | undefined,
+): 'in-process' | 'cli' {
+  if (explicit) return explicit;
+  const env =
+    typeof process !== 'undefined' ? process.env?.SAS_CHAT_TOOL_TRANSPORT : undefined;
+  if (env === 'cli') return 'cli';
+  if (env === 'in-process') return 'in-process';
+  return 'in-process';
 }
 
 /**
@@ -71,14 +113,63 @@ export interface BuildPanelToolsOptions {
  * the CLI subprocess (which has no notion of "active scene") could target
  * the wrong scene.
  */
+/**
+ * Project-scoped / deferred tools promoted onto the agent's DEFAULT
+ * declaration set (Phase 5b). The scene scan hides everything project-scoped
+ * and deferred; before promotion the agent burned a tool_search hop for each
+ * of these on every producer-loop turn (job polling, verify, inspect,
+ * checkpoint/undo, transitions, deck transport, save). Promotion is DATA —
+ * trim per Errantry friction diff. Each entry costs prompt tokens on every
+ * request (~13 tools ≈ +3.3–4.5k tokens), so promote sparingly.
+ */
+export const PROMOTED_PROJECT_TOOLS: readonly string[] = [
+  'get_job_status',
+  'wait_for_job',
+  'sas_render_preview',
+  'sas_inspect_project',
+  'sas_inspect_scene',
+  'sas_history_checkpoint',
+  'sas_history_undo',
+  'create_transition',
+  'list_transitions',
+  'deck_play',
+  'deck_stop',
+  'project_save',
+];
+
 export async function buildPanelTools(
   options: BuildPanelToolsOptions
 ): Promise<PanelTools> {
   const { host, cliPaths, awaitUserResponse } = options;
-  const appTools = await host.listAppTools({ scope: 'scene' });
+  const transport = resolveTransport(options.transport);
+  const inProcessTimeoutMs =
+    options.inProcessTimeoutMs ?? DEFAULT_IN_PROCESS_TIMEOUT_MS;
+  // Defensive copy — we append promoted tools below and must never mutate
+  // the array the host handed us.
+  const appTools = [...(await host.listAppTools({ scope: 'scene' }))];
   const declarations: LLMFunctionDeclaration[] = appTools.map(
     toFunctionDeclaration,
   );
+  // Deferred-tool cache (declared early so the promotion scan can seed it —
+  // see the lazy-resolution comment further down for why it exists).
+  const deferredCache = new Map<string, PluginAppTool>();
+  // Surface promotion (Phase 5b): ONE includeDeferred scan, filtered to the
+  // allowlist, deduped against the scene surface. The same scan seeds the
+  // deferred cache, so tool_search→invoke dispatches need no extra lookup.
+  // Failures degrade to the un-promoted surface — tool_search still reaches
+  // everything via the lazy path.
+  try {
+    const fullSurface = await host.listAppTools({ includeDeferred: true });
+    for (const t of fullSurface) deferredCache.set(t.name, t);
+    const sceneNames = new Set(appTools.map((t) => t.name));
+    const promoted = fullSurface.filter(
+      (t) => PROMOTED_PROJECT_TOOLS.includes(t.name) && !sceneNames.has(t.name),
+    );
+    declarations.push(...promoted.map(toFunctionDeclaration));
+    appTools.push(...promoted);
+  } catch {
+    // un-promoted surface is still functional
+  }
   // Promote the persistent per-project journal (sas_project_notes_*) onto the
   // default surface so the agent uses its cross-session memory without a
   // tool_search first. They're project-scoped (excluded from the scene scan);
@@ -91,13 +182,14 @@ export async function buildPanelTools(
   // The session task/goal ledger is always available — plugin-local state, not
   // gated on the clarification transport.
   declarations.push(buildTaskLedgerDeclaration());
+  // Taste/preference memory (Phase 5c) — always available, plugin-local.
+  declarations.push(buildProducerPreferencesDeclaration());
   const tools: LLMTool[] =
     declarations.length > 0 ? [{ functionDeclarations: declarations }] : [];
 
   const toolByName = new Map<string, PluginAppTool>(
     appTools.map((t) => [t.name, t])
   );
-  const activeSceneId = host.getActiveSceneId();
 
   // Lazy deferred-tool resolution. `host.listAppTools({ scope: 'scene' })`
   // above intentionally hides tools registered with `deferLoading: true`
@@ -113,7 +205,9 @@ export async function buildPanelTools(
   // The CLI subprocess path (`invokeSas` → /api/v1/execute) does NOT
   // check `deferLoading` — that flag gates discovery, not execution —
   // so once we have a def, the rest of the executor is unchanged.
-  const deferredCache = new Map<string, PluginAppTool>();
+  //
+  // The cache itself is declared above (the promotion scan pre-seeds it);
+  // this lazy path only fires when that scan failed.
   let deferredListPromise: Promise<PluginAppTool[]> | null = null;
 
   async function resolveDeferredTool(
@@ -194,6 +288,11 @@ export async function buildPanelTools(
       return handleTaskLedger(host, args);
     }
 
+    if (name === PRODUCER_PREFERENCES_TOOL_NAME) {
+      // Synthetic tool — durable taste memory in project-scoped plugin_data.
+      return handleProducerPreferences(host, args);
+    }
+
     let def: PluginAppTool | null = toolByName.get(name) ?? null;
     if (!def) {
       // Not in the default scene-scoped surface — check the deferred
@@ -232,27 +331,129 @@ export async function buildPanelTools(
       toolByName.set(name, def);
     }
 
-    const params = injectActiveSceneId(args, def, activeSceneId);
-    const sasResult = await invokeSas({
-      action: name,
-      params,
-      appExe: cliPaths.appExe,
-      cliEntry: cliPaths.cliEntry,
-      onProgress,
-    });
-    return {
-      success: sasResult.success,
-      exitCode: sasResult.exitCode,
-      stdout: sasResult.stdout,
-      stderr: sasResult.stderr,
-      // Pull nextSteps off the CLI's parsed OperationResult so the agent loop
-      // can emit a `next_steps` event. The CLI does the substitution work
-      // (IDs filled in, mcp form populated) — we just narrow the shape.
-      nextSteps: extractNextSteps(sasResult.parsedStdout),
-    };
+    // Active scene id is read at CALL time (not captured at build time):
+    // tool calls earlier in this very turn can switch the active scene
+    // (compose_scene), and Phase 2b keeps one loop alive across scene
+    // changes — a build-time snapshot would silently target a dead scene.
+    const params = injectActiveSceneId(args, def, host.getActiveSceneId());
+
+    if (transport === 'cli') {
+      if (!cliPaths) {
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr:
+            `Tool '${name}' could not be dispatched: CLI transport selected ` +
+            `but the host provided no CLI paths (sas binary not built?).`,
+        };
+      }
+      const sasResult = await invokeSas({
+        action: name,
+        params,
+        appExe: cliPaths.appExe,
+        cliEntry: cliPaths.cliEntry,
+        onProgress,
+      });
+      return {
+        success: sasResult.success,
+        exitCode: sasResult.exitCode,
+        stdout: sasResult.stdout,
+        stderr: sasResult.stderr,
+        // Pull nextSteps off the CLI's parsed OperationResult so the agent loop
+        // can emit a `next_steps` event. The CLI does the substitution work
+        // (IDs filled in, mcp form populated) — we just narrow the shape.
+        nextSteps: extractNextSteps(sasResult.parsedStdout),
+      };
+    }
+
+    return executeInProcess(host, name, params, inProcessTimeoutMs);
   };
 
   return { tools, executor };
+}
+
+/**
+ * In-process dispatch: `host.executeAppTool` → ToolRegistry directly, with
+ * agent provenance so emitted domain events are attributed correctly.
+ *
+ * Result mapping keeps the SAME shape the CLI transport produced so
+ * `truncateForLLM`, `extractNextSteps`, the UI rows, and the Errantry
+ * metrics all stay stable:
+ *   - success → serialized OperationResult in `stdout` (what the CLI prints)
+ *   - failure → serialized OperationResult in `stderr` (where the CLI puts
+ *     the structured remediation/clarification envelope)
+ *
+ * Exported for unit testing.
+ */
+export async function executeInProcess(
+  host: PluginHost,
+  name: string,
+  params: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<ToolExecutionResult> {
+  type ExecuteAppToolWithOpts = (
+    name: string,
+    params: Record<string, unknown>,
+    opts?: { provenance?: 'agent' | 'user' },
+  ) => ReturnType<PluginHost['executeAppTool']>;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const watchdog = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new Error(
+          `Tool '${name}' timed out after ${Math.round(timeoutMs / 1000)}s ` +
+            `(in-process watchdog). The operation may still complete in the ` +
+            `background — re-inspect state before retrying.`,
+        ),
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    // The third (opts) argument is SDK 2.18.0; older hosts simply ignore
+    // extra arguments, so this is safe across host versions.
+    const res = await Promise.race([
+      (host.executeAppTool as ExecuteAppToolWithOpts)(name, params, {
+        provenance: 'agent',
+      }),
+      watchdog,
+    ]);
+
+    // `res.data` carries the FULL OperationResult (remediation,
+    // clarification, nextSteps, changes). Fall back to the thin wrapper
+    // fields if a host predates the data passthrough.
+    const op: Record<string, unknown> = isRecord(res.data)
+      ? res.data
+      : {
+          success: res.success,
+          action: res.action,
+          message: res.message,
+          error: res.error,
+        };
+    const serialized = JSON.stringify(op);
+    if (res.success) {
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: serialized,
+        stderr: '',
+        nextSteps: extractNextSteps(op),
+      };
+    }
+    return {
+      success: false,
+      exitCode: 1,
+      stdout: '',
+      stderr: serialized,
+    };
+  } catch (err) {
+    const stderr = err instanceof Error ? err.message : String(err);
+    return { success: false, exitCode: 1, stdout: '', stderr };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /**
@@ -357,6 +558,52 @@ function buildTaskLedgerDeclaration(): LLMFunctionDeclaration {
           type: 'string',
           enum: ['todo', 'in_progress', 'done'],
           description: 'For update: the new status of the goal.',
+        },
+      },
+      required: ['op'],
+    },
+  };
+}
+
+/**
+ * Synthetic declaration for `producer_preferences` — the durable taste
+ * memory (Phase 5c). One structured preference per lesson, reflexion-style:
+ * recorded when the user REACTS to something they heard, read back every
+ * turn via the "Producer preferences" ambient block.
+ */
+function buildProducerPreferencesDeclaration(): LLMFunctionDeclaration {
+  return {
+    name: PRODUCER_PREFERENCES_TOOL_NAME,
+    description:
+      "Record and maintain the user's DURABLE PRODUCTION PREFERENCES — short structured lessons about their taste ('bass low in the mix', 'prefers sparse hats', 'choruses are 8 bars'). Call op=add ONCE when the user reacts to something they heard with a clear preference signal ('too loud', 'love that swing') or states a durable preference. source='explicit' ONLY for things the user literally said; use source='inferred' for lessons you deduced. Active preferences are shown back to you in the 'Current state' preamble — honor them without being asked. Use op=update/remove when a preference changes; op=list for the full set. Silent bookkeeping: don't announce writes. NOT for session goals (chat_task_ledger) or one-off instructions.",
+    parameters: {
+      type: 'object',
+      properties: {
+        op: {
+          type: 'string',
+          enum: ['list', 'add', 'update', 'remove'],
+          description:
+            'add: record one preference. update: replace the text of one by 1-based index. remove: delete one by 1-based index. list: return all.',
+        },
+        category: {
+          type: 'string',
+          enum: ['mix', 'density', 'fx', 'tone', 'reference', 'workflow'],
+          description:
+            'For add: what the preference is about. mix=levels/balance, density=busy vs sparse, fx=effects taste, tone=timbre/sound character, reference=artists/genres they cite, workflow=how they like to work.',
+        },
+        text: {
+          type: 'string',
+          description: 'For add/update: ONE terse sentence stating the preference.',
+        },
+        source: {
+          type: 'string',
+          enum: ['explicit', 'inferred'],
+          description:
+            "For add: 'explicit' = the user said it in so many words; 'inferred' = deduced from their reactions. Never record guesses as explicit.",
+        },
+        index: {
+          type: 'integer',
+          description: 'For update/remove: the 1-based index shown by op=list / the preamble.',
         },
       },
       required: ['op'],
@@ -519,8 +766,11 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 /** Cap the preamble so it doesn't crowd out tool descriptions or conversation
  *  history in the model's context budget. Bumped 2KB→2.6KB in Phase 2 to hold
- *  the session-goals + remembered-preferences blocks. */
-const AMBIENT_CONTEXT_CAP = 2_600;
+ *  the session-goals + journal-tail blocks; 2.6KB→3KB in Phase 5c for the
+ *  producer-preferences block. */
+const AMBIENT_CONTEXT_CAP = 3_000;
+/** Max preference lines shown in the preamble; the rest collapse to a count. */
+const AMBIENT_MAX_PREFERENCES = 6;
 const AMBIENT_MAX_SCENES = 8;
 const AMBIENT_MAX_TRACKS = 16;
 const AMBIENT_MAX_HISTORY = 3;
@@ -720,6 +970,166 @@ async function handleTaskLedger(
   return { success: true, exitCode: 0, stdout: summary, stderr: '' };
 }
 
+// --- Producer preferences (durable taste memory, Phase 5c) ------------------
+
+/** project-scoped plugin_data key for the preference memory. */
+const PREFERENCES_KEY = 'chat.preferences.v1';
+/** Hard cap on stored preferences; eviction drops INFERRED entries first
+ *  (oldest-first within each source class) — explicit user statements are
+ *  the last to go. */
+const MAX_PREFERENCES = 30;
+
+type PreferenceCategory = 'mix' | 'density' | 'fx' | 'tone' | 'reference' | 'workflow';
+type PreferenceSource = 'explicit' | 'inferred';
+interface ProducerPreference {
+  category: PreferenceCategory;
+  text: string;
+  source: PreferenceSource;
+}
+
+const PREFERENCE_CATEGORIES: ReadonlySet<string> = new Set([
+  'mix', 'density', 'fx', 'tone', 'reference', 'workflow',
+]);
+
+function isProducerPreference(v: unknown): v is ProducerPreference {
+  return (
+    isRecord(v) &&
+    typeof v.text === 'string' &&
+    PREFERENCE_CATEGORIES.has(String(v.category)) &&
+    (v.source === 'explicit' || v.source === 'inferred')
+  );
+}
+
+async function readPreferences(host: PluginHost): Promise<ProducerPreference[]> {
+  const getter = (host as {
+    getProjectData?: <T>(key: string) => Promise<T | null>;
+  }).getProjectData;
+  if (typeof getter !== 'function') return [];
+  try {
+    const raw = await getter.call(host, PREFERENCES_KEY);
+    return Array.isArray(raw) ? raw.filter(isProducerPreference) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Evict to the cap, inferred-first then oldest-first. Exported for tests. */
+export function evictPreferences(prefs: ProducerPreference[]): ProducerPreference[] {
+  if (prefs.length <= MAX_PREFERENCES) return prefs;
+  const out = [...prefs];
+  while (out.length > MAX_PREFERENCES) {
+    const inferredIdx = out.findIndex((p) => p.source === 'inferred');
+    out.splice(inferredIdx >= 0 ? inferredIdx : 0, 1);
+  }
+  return out;
+}
+
+/**
+ * Synthetic `producer_preferences` handler — durable taste memory in
+ * project-scoped plugin_data. Mirrors handleTaskLedger's structure.
+ */
+async function handleProducerPreferences(
+  host: PluginHost,
+  args: Record<string, unknown>,
+): Promise<ToolExecutionResult> {
+  const setter = (host as {
+    setProjectData?: (key: string, value: unknown) => Promise<void>;
+  }).setProjectData;
+  const getter = (host as {
+    getProjectData?: <T>(key: string) => Promise<T | null>;
+  }).getProjectData;
+  if (typeof setter !== 'function' || typeof getter !== 'function') {
+    return {
+      success: false,
+      exitCode: 1,
+      stdout: '',
+      stderr:
+        'producer_preferences is unavailable in this session (host lacks project-data storage).',
+    };
+  }
+
+  const op = typeof args.op === 'string' ? args.op : '';
+  let prefs = await readPreferences(host);
+
+  const render = (): string =>
+    prefs.length === 0
+      ? 'No producer preferences recorded.'
+      : 'Producer preferences:\n' +
+        prefs
+          .map((p, i) => `  ${i + 1}. [${p.category}] ${p.text} (${p.source})`)
+          .join('\n');
+
+  if (op === 'list') {
+    return { success: true, exitCode: 0, stdout: render(), stderr: '' };
+  }
+
+  if (op === 'add') {
+    const category = String(args.category ?? '');
+    const text = typeof args.text === 'string' ? args.text.trim() : '';
+    const source = args.source === 'explicit' ? 'explicit' : 'inferred';
+    if (!PREFERENCE_CATEGORIES.has(category)) {
+      return {
+        success: false,
+        exitCode: 1,
+        stdout: '',
+        stderr: `producer_preferences add: 'category' must be one of mix, density, fx, tone, reference, workflow.`,
+      };
+    }
+    if (text.length === 0) {
+      return {
+        success: false,
+        exitCode: 1,
+        stdout: '',
+        stderr: "producer_preferences add: requires a non-empty 'text'.",
+      };
+    }
+    prefs.push({ category: category as PreferenceCategory, text, source });
+    prefs = evictPreferences(prefs);
+  } else if (op === 'update' || op === 'remove') {
+    const index = typeof args.index === 'number' ? args.index : Number(args.index);
+    if (!Number.isInteger(index) || index < 1 || index > prefs.length) {
+      return {
+        success: false,
+        exitCode: 1,
+        stdout: '',
+        stderr: `producer_preferences ${op}: index ${String(args.index)} is out of range (1..${prefs.length}).`,
+      };
+    }
+    if (op === 'remove') {
+      prefs.splice(index - 1, 1);
+    } else {
+      const text = typeof args.text === 'string' ? args.text.trim() : '';
+      if (text.length === 0) {
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr: "producer_preferences update: requires a non-empty 'text'.",
+        };
+      }
+      prefs[index - 1] = { ...prefs[index - 1], text };
+    }
+  } else {
+    return {
+      success: false,
+      exitCode: 1,
+      stdout: '',
+      stderr: `producer_preferences: unknown op '${op}'. Use list, add, update, or remove.`,
+    };
+  }
+
+  try {
+    await setter.call(host, PREFERENCES_KEY, prefs);
+  } catch (err) {
+    const stderr = err instanceof Error ? err.message : String(err);
+    return { success: false, exitCode: 1, stdout: '', stderr };
+  }
+  // setProjectData does not broadcast a mutation — invalidate so the next
+  // preamble render reflects the write.
+  invalidateAmbientCache(host);
+  return { success: true, exitCode: 0, stdout: render(), stderr: '' };
+}
+
 interface AmbientScene {
   id?: string;
   name?: string;
@@ -820,9 +1230,10 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
       ? changes.musical_context
       : null;
 
-    // Cross-session + session state (defensive; neither blocks the preamble).
+    // Cross-session + session state (defensive; none of these block the preamble).
     const ledger = await readTaskLedger(host);
     const journalBody = await readProjectJournal(host);
+    const preferences = await readPreferences(host);
 
     const lines: string[] = ['=== Current state (auto-refreshed each turn) ==='];
 
@@ -941,6 +1352,21 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
         .map((h) => h.action ?? h.description ?? '?')
         .join(' → ');
       lines.push(`Recent actions: ${recent}`);
+    }
+
+    // Producer preferences — the durable taste memory (Phase 5c). Shown every
+    // turn so recorded lessons are HONORED without re-asking; the 1-based
+    // index is what producer_preferences update/remove reference.
+    if (preferences.length > 0) {
+      lines.push('Producer preferences (honor these; manage via producer_preferences):');
+      preferences.slice(0, AMBIENT_MAX_PREFERENCES).forEach((p, i) => {
+        lines.push(`  ${i + 1}. [${p.category}] ${p.text}`);
+      });
+      if (preferences.length > AMBIENT_MAX_PREFERENCES) {
+        lines.push(
+          `  (+${preferences.length - AMBIENT_MAX_PREFERENCES} more — producer_preferences op=list)`,
+        );
+      }
     }
 
     // Remembered notes & preferences — tail of the persistent per-project

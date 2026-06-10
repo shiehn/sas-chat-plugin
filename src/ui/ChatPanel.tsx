@@ -527,6 +527,11 @@ function applyEvent(
       ];
     }
 
+    case 'iterations_extended':
+      // The user approved continuing past the step budget. The ask_user
+      // question/answer card already rendered through the clarification
+      // flow; nothing extra to draw — the loop just keeps producing rows.
+      return entries;
     case 'iteration_limit':
       return removeThinking(entries, turnId).map((e) =>
         e.kind === 'assistant' && e.turnId === turnId
