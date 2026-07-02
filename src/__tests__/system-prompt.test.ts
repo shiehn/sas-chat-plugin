@@ -19,9 +19,15 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/2\/4\/8\/16-bar/);
   });
 
-  it('defines Transition as a short bridge between scenes', () => {
+  it('defines Transition with the transition-as-scene model (not the deleted legacy pipeline)', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Transition:/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/bridge/);
+    // Migration 073 model: a transition IS a scene, authored in the target key.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/scene_type='transition'/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/TARGET scene's key/);
+    // Regression guard: the legacy "short bridge (1-4 bars) ... rendered WAV"
+    // description must not come back — that pipeline was deleted.
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/1-4 bars/);
   });
 
   it('defines both decks (LOOP-A=cue, LOOP-B=performance/main)', () => {
@@ -75,11 +81,27 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
   });
 
   it('points at design docs for implementation-detail questions', () => {
-    // Specific doc paths the agent can fs_read_file against.
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/docs\/transition-generator\.md/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/CLAUDE\.md/);
     // And the discovery hint so the agent knows it can fetch them.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/fs_read_file/);
+    // docs/transition-generator.md described the DELETED six-stage pipeline —
+    // the pointer must stay gone or the agent cites a dead architecture.
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/transition-generator\.md/);
+  });
+
+  it('carries the capability quick-index with real registered tool names', () => {
+    // Names verified against src/main/tools registration at edit time; the
+    // sas-app-side guard (chat-promoted-tools-exist.test.ts) checks the
+    // PROMOTED list, this checks the prompt vocabulary.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/dsl_sound_history/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/dsl_sound_restore/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/scene_set_bars/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/performance_stack_add_node/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/recording_start/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_split_stems/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/ableton_export_scene/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/compose_contract/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/add_instrument/);
   });
 
   it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {

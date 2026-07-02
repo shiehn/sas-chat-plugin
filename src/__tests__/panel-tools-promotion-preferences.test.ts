@@ -134,6 +134,15 @@ describe('surface promotion (Phase 5b)', () => {
   it('the promotion list stays modest (prompt-token budget)', () => {
     expect(PROMOTED_PROJECT_TOOLS.length).toBeLessThanOrEqual(15);
   });
+
+  it('never re-promotes tools deleted with the legacy transition pipeline', () => {
+    // These two silently no-op'd for weeks after the legacy pipeline was
+    // removed (the promotion filter drops unknown names without error).
+    // The registry-side existence check lives in sas-app
+    // (chat-promoted-tools-exist.test.ts); this is the local tripwire.
+    expect(PROMOTED_PROJECT_TOOLS).not.toContain('create_transition');
+    expect(PROMOTED_PROJECT_TOOLS).not.toContain('list_transitions');
+  });
 });
 
 describe('producer_preferences (Phase 5c)', () => {

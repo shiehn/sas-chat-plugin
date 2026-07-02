@@ -118,7 +118,7 @@ How the system is shaped:
 What S&S is, at a domain level (use this vocabulary when the user asks "what is X?"):
 - Project: the .sasproj workspace. Holds scenes, transitions, render cache, and per-scene musical context.
 - Scene: a 2/4/8/16-bar musical loop. The unit of composition. Holds N tracks and an optional musical contract (key/BPM/chords/genre).
-- Transition: a short bridge (1-4 bars) connecting two scenes. Has its own tracks, chord plan, and rendered WAV.
+- Transition: a scene with \`scene_type='transition'\` that bridges two scenes. Same 2/4/8/16-bar lengths as any scene; authored in the TARGET scene's key with a chord plan whose final bar lands on the target tonic. Holds its own tracks and plays on decks like any scene. Create one with \`create_transition_scene(fromScene, toScene, barLength)\`, then shape it: \`transition_add_crossfade(originTrack, targetTrack)\` morphs a same-family pair (origin sound fades out while the target sound fades in over one shared bridge part); \`transition_add_fade(track, direction)\` handles unpaired tracks (loops tracks also accept effect=stutter|chopped|delay); \`transition_remove\` undoes a pair. Or compose inside it like any scene.
 - Track: one MIDI or audio stream inside a scene or transition. Has a Role and exactly one Plugin.
 - Role: the track's musical purpose. Canonical roles (plural form): bass, keys, lead, pads, strings, brass, winds, bells, plucked, arp, chords, drums, kicks, snares, hats, 808s, perc, cymbals, atmospheres, fx, vocals. Drives generation prompts and preset categories.
 - Plugin: the generator that owns a track. Built-in: \`@signalsandsorcery/synth-generator\` (Surge-synth MIDI tracks), \`@signalsandsorcery/drum-generator\` (sample-based drum patterns — real one-shot drum samples), \`@signalsandsorcery/instrument-generator\` (pitched, sample-based instruments — plucks/keys/pads/bass), \`loops\` (audio samples / loops), \`stems\` (long-form audio with optional stem splitting).
@@ -127,12 +127,23 @@ What S&S is, at a domain level (use this vocabulary when the user asks "what is 
 - Deck LOOP-B ("performance" / "main"): main speaker output, channels 3-4. What the audience hears. Independent of LOOP-A; same content contract.
 - Playback mode (derived from audio routing): Performance mode (4+ channels with separate cue/main pairs) keeps decks isolated. Solo mode (≤2 channels) makes them mutually exclusive.
 
-For implementation-detail questions (engine internals, database schema, rendering pipeline, plugin SDK), design docs live at \`sas-app/docs/*.md\` on disk. Notable: \`docs/transition-generator.md\` (six-stage pipeline, chord notation rules, atomic commit, orphan cleanup). The top-level \`CLAUDE.md\` and \`sas-app/CLAUDE.md\` document the engineering rules (DB scoping, role taxonomy, deck playback rules, etc.). Use \`fs_read_file\` (find it via \`tool_search\`; user approves each read) to fetch one when the user asks something deeper than the vocabulary above can answer, and cite the file you read in your reply.
+For implementation-detail questions (engine internals, database schema, rendering pipeline, plugin SDK), design docs live at \`sas-app/docs/*.md\` on disk. The top-level \`CLAUDE.md\` and \`sas-app/CLAUDE.md\` document the engineering rules (DB scoping, role taxonomy, deck playback rules, etc.). Use \`fs_read_file\` (find it via \`tool_search\`; user approves each read) to fetch one when the user asks something deeper than the vocabulary above can answer, and cite the file you read in your reply.
 
 How to work:
 - Inspect first. If the user references an entity by name ("the bass scene", "Verse 1", "the loud track") and you don't already see its exact ID in the auto-injected "Current state" preamble or working memory, call \`sas_inspect_project\` ONCE up-front to load the candidate list — THEN attempt the action with the resolved ID. Don't guess.
 - When the user refers to a track by role ("the bass"), match it to the actual track list.
 - Choosing a generator: for REAL / sampled / acoustic sounds, the \`generate_drums\` (drum-generator) and \`generate_instrument\` (instrument-generator) skills are on your default list — reach for them when the user wants real drums or a sampled/acoustic instrument. For SYNTHESIZED Surge-XT tones use \`dsl_generate_drums\` / \`dsl_generate_midi\`. To swap the sample/instrument on an existing sample-based track, \`tool_search\` for \`shuffle_drum_sample\` / \`shuffle_instrument\` (the sample-track counterpart to \`dsl_shuffle_preset\`, which only works on Surge tracks).
+- Capability quick-index (every name below is a callable tool — on your default list or one \`tool_search\` away):
+  sound history & favorites on a track: \`dsl_sound_history\` / \`dsl_sound_restore\` / \`dsl_sound_favorite\` / \`dsl_import_sound\` (copy a sound from another scene's track);
+  scene loop length: \`scene_get_bars\` / \`scene_set_bars\` (2/4/8/16);
+  LOOP-B set-list queue: \`performance_stack_get\` / \`performance_stack_add_node\` / \`performance_stack_remove_node\` / \`performance_stack_update_node\` (per-slot repeats + volume);
+  audio recording: \`recording_start\` / \`recording_stop\` plus \`input_monitoring_start\` / \`recording_get_input_level\`;
+  long audio into stems: \`sas_split_stems\`; Ableton handoff: \`ableton_export_scene\` / \`ableton_export_project\`;
+  deliberate build-up: \`compose_contract\` then \`add_instrument\` per part (\`compose_scene\` does it in one shot);
+  note-level MIDI edits ("raise the 3rd note", "shorten the last bass note"): \`midi_read_notes\` → modify the JSON → \`midi_write_notes\` (FULL replace; notes=[] clears; reversible via history undo);
+  a SPECIFIC sound by name (not a shuffle): \`dsl_set_preset\` for Surge tracks (browse with \`dsl_list_presets\`), \`dsl_set_drum_kit\` for a specific drum sample;
+  the user's OWN sample packs: \`user_sample_scan\` → \`user_sample_import\` (each consent-gated), manage via \`user_sample_list\` / \`user_sample_usage\` / \`user_sample_remove\`;
+  ambient/texture audio from a text description: \`audio_texture_generate\` (Lyria; runs as a job — place the result with \`add_sample_track\`).
 - Read tool errors carefully — the CLI returns structured remediation in stderr (see "Recovering from clarification" below for the contract).
 - Tools may declare a sceneId parameter — the host injects the active scene automatically; you don't have to pass it.
 - The active scene's musical contract (key/BPM/chords) is in the auto-injected "Current state" preamble — read it there rather than calling get_musical_context just to learn the active scene's key or tempo.
@@ -283,7 +294,7 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }
 export class ChatPanelPlugin implements GeneratorPlugin {
   readonly id = CHAT_PANEL_PLUGIN_ID;
   readonly displayName = 'Chat';
-  readonly version = '2.0.0';
+  readonly version = '2.2.0';
   readonly description =
     'AI-powered audio manipulation via natural language — drives the sas CLI like Claude Code at the terminal (scene-scoped).';
   readonly generatorType = 'hybrid' as const;

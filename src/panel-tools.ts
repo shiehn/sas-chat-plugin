@@ -130,8 +130,11 @@ export const PROMOTED_PROJECT_TOOLS: readonly string[] = [
   'sas_inspect_scene',
   'sas_history_checkpoint',
   'sas_history_undo',
-  'create_transition',
-  'list_transitions',
+  // Transition-as-scene tools (the legacy create_transition / list_transitions
+  // were deleted with the old pipeline). transition_remove stays tool_search-only.
+  'create_transition_scene',
+  'transition_add_crossfade',
+  'transition_add_fade',
   'deck_play',
   'deck_stop',
   'project_save',
