@@ -46,6 +46,12 @@ export interface ChatPanelProps {
    * non-accordion hosts (tests, stories) → legacy mount-only focus.
    */
   isExpanded?: boolean;
+  /**
+   * Stop the in-flight agent turn. When provided, a stop button renders
+   * while a turn is processing. Omitted on hosts whose preload predates
+   * the stop channel (button simply absent — never a broken affordance).
+   */
+  onStop?: () => void;
 }
 
 /** Synthetic tool name the agent loop emits when the model calls ask_user. */
@@ -89,9 +95,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   initialEntries = [],
   registerReset,
   isExpanded,
+  onStop,
 }) => {
   const [entries, setEntries] = useState<TerminalEntry[]>(initialEntries);
   const [isProcessing, setIsProcessing] = useState(false);
+  /** True after the user clicks stop, until the turn actually unwinds. */
+  const [stopRequested, setStopRequested] = useState(false);
   const [pendingClarification, setPendingClarification] =
     useState<PendingClarification | null>(null);
   const pendingClarificationRef = useRef<PendingClarification | null>(null);
@@ -193,6 +202,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       };
       setEntries((prev) => [...prev, userEntry]);
       setIsProcessing(true);
+      setStopRequested(false);
 
       const onEvent = (event: AgentLoopEvent): void => {
         setEntries((prev) => applyEvent(prev, event, turnId));
@@ -246,6 +256,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         setEntries((prev) => [...prev, errorEntry]);
       } finally {
         setIsProcessing(false);
+        setStopRequested(false);
         // Belt-and-suspenders: if the loop unwound while a clarification
         // was still showing, drop it so the input box returns to its
         // normal mode.
@@ -254,6 +265,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     },
     [sendMessage, submitClarification]
   );
+
+  const handleStopClick = useCallback((): void => {
+    if (!onStop || stopRequested) return;
+    setStopRequested(true);
+    onStop();
+  }, [onStop, stopRequested]);
 
   const handleQuickReply = useCallback(
     (response: string): void => {
@@ -299,6 +316,30 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         onQuickReply={handleQuickReply}
         onNextStep={handleNextStep}
       />
+      {isProcessing && onStop && (
+        <div style={{ padding: '0 10px 4px', display: 'flex', justifyContent: 'flex-end' }}>
+          <button
+            type="button"
+            data-testid="chat-stop-button"
+            onClick={handleStopClick}
+            disabled={stopRequested}
+            aria-label="Stop the current turn"
+            style={{
+              fontFamily: 'JetBrains Mono, SF Mono, Menlo, Monaco, Consolas, monospace',
+              fontSize: 11,
+              lineHeight: '18px',
+              color: stopRequested ? 'rgba(247,255,251,0.4)' : '#FF7A7A',
+              background: 'transparent',
+              border: '1px solid rgba(255, 122, 122, 0.35)',
+              borderRadius: 3,
+              padding: '0 8px',
+              cursor: stopRequested ? 'default' : 'pointer',
+            }}
+          >
+            {stopRequested ? 'stopping…' : '■ stop'}
+          </button>
+        </div>
+      )}
       <InputBox
         onSend={handleSend}
         disabled={inputDisabled}
@@ -532,6 +573,10 @@ function applyEvent(
       // question/answer card already rendered through the clarification
       // flow; nothing extra to draw — the loop just keeps producing rows.
       return entries;
+    case 'aborted':
+      // The stop itself renders via the final_text that always follows;
+      // just make sure no thinking row lingers.
+      return removeThinking(entries, turnId);
     case 'iteration_limit':
       return removeThinking(entries, turnId).map((e) =>
         e.kind === 'assistant' && e.turnId === turnId

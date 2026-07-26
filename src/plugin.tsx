@@ -210,6 +210,9 @@ interface ChatPluginRendererBridge {
    *  flows. The chat plugin can run on older preload bundles that predate
    *  the ask_user wiring without crashing. */
   sendClarificationResponse?(response: string): Promise<void>;
+  /** Optional — stop the in-flight agent turn (older preloads lack it; the
+   *  stop button simply doesn't render then). */
+  stop?(): Promise<unknown>;
 }
 
 /**
@@ -271,6 +274,12 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }
     await bridge.sendClarificationResponse(response);
   };
 
+  // Stop affordance only renders when the preload exposes the stop channel.
+  const canStop = typeof bridgeRef.current?.stop === 'function';
+  const handleStop = (): void => {
+    void bridgeRef.current?.stop?.().catch(() => undefined);
+  };
+
   if (!bridgeAvailable) {
     return React.createElement(
       'div',
@@ -282,6 +291,7 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }
   return React.createElement(ChatPanel, {
     sendMessage,
     sendClarificationResponse,
+    onStop: canStop ? handleStop : undefined,
     isExpanded,
   });
 };
@@ -294,7 +304,7 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }
 export class ChatPanelPlugin implements GeneratorPlugin {
   readonly id = CHAT_PANEL_PLUGIN_ID;
   readonly displayName = 'Chat';
-  readonly version = '2.2.0';
+  readonly version = '2.3.0';
   readonly description =
     'AI-powered audio manipulation via natural language — drives the sas CLI like Claude Code at the terminal (scene-scoped).';
   readonly generatorType = 'hybrid' as const;
@@ -440,7 +450,18 @@ export class ChatPanelPlugin implements GeneratorPlugin {
     }
   }
 
+  /**
+   * Stop the in-flight agent turn (chat-panel stop button via IPC, or the
+   * Errantry bridge unsticking a hung prior run). Safe no-op when idle.
+   */
+  stop(): void {
+    this.agent?.abort('user');
+  }
+
   async deactivate(): Promise<void> {
+    // Unblock any in-flight run so its finally-cleanup executes promptly
+    // instead of waiting out a wedged provider/tool call.
+    this.agent?.abort('user');
     this.host = null;
     this.agent = null;
     this.panelTools = null;

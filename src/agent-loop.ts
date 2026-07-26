@@ -180,7 +180,23 @@ export type AgentLoopEvent =
       iterations: number;
       newLimit: number;
     }
+  | {
+      /**
+       * The run was stopped before the model finished — either the user hit
+       * the stop button (`reason: 'user'`, via `AgentLoop.abort()`) or the
+       * per-turn wall-clock budget expired (`reason: 'budget'`). Always
+       * followed by a `final_text` event carrying the user-facing stop
+       * message, so existing consumers that only know final_text stay
+       * correct without changes.
+       */
+      type: 'aborted';
+      iterations: number;
+      reason: AbortReason;
+    }
   | { type: 'final_text'; iterations: number; text: string };
+
+/** Why a run stopped early: the user asked, or the turn ran out of time. */
+export type AbortReason = 'user' | 'budget';
 
 export type AgentLoopEventHandler = (event: AgentLoopEvent) => void;
 
@@ -218,6 +234,12 @@ export interface AgentLoopOptions {
    *  swallowed; the turn proceeds without ambient context. Called once per
    *  run() (not per iteration). */
   getAmbientContext?: () => Promise<string>;
+  /** Per-turn wall-clock ceiling, ms. When it expires the run aborts with
+   *  reason 'budget' (same path as the user stop button). A safety net for
+   *  wedged tools/providers, NOT a UX pacing knob — the default is generous
+   *  (10 min) because legitimate composite chains (compose_scene →
+   *  add_instrument×N → render) run for minutes. */
+  turnBudgetMs?: number;
 }
 
 export interface AgentLoopResult {
@@ -227,6 +249,8 @@ export interface AgentLoopResult {
   iterations: number;
   /** True when the loop exited because it hit `maxIterations`. */
   iterationLimitHit: boolean;
+  /** Set when the run was stopped early (stop button / turn budget). */
+  aborted?: AbortReason;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +258,8 @@ export interface AgentLoopResult {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_ITERATIONS = 25;
+/** Default per-turn wall-clock ceiling (see AgentLoopOptions.turnBudgetMs). */
+export const DEFAULT_TURN_BUDGET_MS = 10 * 60_000;
 /** Iterations granted per user-approved extension at the budget cap. */
 export const ITERATION_EXTENSION_STEP = 15;
 /** Max number of user-approved extensions per turn. */
@@ -321,6 +347,14 @@ export class AgentLoop {
   private isRunning = false;
   /** A reset() request that arrived while running; applied at run end. */
   private pendingReset = false;
+  /** Why the current run is being stopped, if a stop was requested. Set by
+   *  `abort()`, cleared at the start of every run. Never survives across
+   *  turns — a stop click racing a normal turn-end must not kill the NEXT
+   *  turn. */
+  private abortReason: AbortReason | null = null;
+  /** Resolves the in-flight run's abort race. Non-null only while running. */
+  private fireAbort: (() => void) | null = null;
+  private readonly turnBudgetMs: number;
   /** A tool-surface swap that arrived while running; applied at run end. */
   private pendingToolSurface: { tools: LLMTool[]; executor: ToolExecutor } | null = null;
   /** Context notes (scene-switch breadcrumbs etc.) prepended to the NEXT
@@ -344,6 +378,27 @@ export class AgentLoop {
     this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     this.onEvent = options.onEvent;
     this.getAmbientContext = options.getAmbientContext;
+    this.turnBudgetMs = options.turnBudgetMs ?? DEFAULT_TURN_BUDGET_MS;
+  }
+
+  /**
+   * Stop the in-flight run (stop button, turn budget, host shutdown, or the
+   * Errantry bridge unsticking a hung prior run). No-op when idle — a stop
+   * that races a completed turn must never poison the next one.
+   *
+   * Semantics: the loop stops WAITING, it does not kill work. An in-flight
+   * LLM call or tool handler keeps running detached (same contract as the
+   * in-process tool watchdog); its effects surface via the mutation
+   * broadcast + next turn's ambient refresh. Conversation history is closed
+   * in a provider-valid shape: any functionCall parts already recorded get
+   * synthetic "stopped" functionResponses, and the turn ends with a model
+   * ack — so the NEXT run never trips Gemini's alternation rules.
+   */
+  abort(reason: AbortReason = 'user'): void {
+    if (!this.isRunning) return;
+    if (this.abortReason) return; // already stopping
+    this.abortReason = reason;
+    this.fireAbort?.();
   }
 
   /** Drop conversation history (user "clear", project switch, Errantry
@@ -444,9 +499,23 @@ export class AgentLoop {
     }
 
     this.isRunning = true;
+    this.abortReason = null;
+    // Abort race primitive for this run. `abort()` resolves it; every
+    // provider/tool await in _runInner races against it so a stop request
+    // unblocks the loop immediately instead of waiting out a wedged call.
+    let fire!: () => void;
+    const abortSignal = new Promise<'aborted'>((resolve) => {
+      fire = (): void => resolve('aborted');
+    });
+    this.fireAbort = fire;
+    // Turn wall-clock budget — safety net for wedged tools/providers.
+    const budgetTimer = setTimeout(() => this.abort('budget'), this.turnBudgetMs);
+    (budgetTimer as { unref?: () => void }).unref?.();
     try {
-      return await this._runInner(userMessage, emit);
+      return await this._runInner(userMessage, emit, abortSignal);
     } finally {
+      clearTimeout(budgetTimer);
+      this.fireAbort = null;
       this.isRunning = false;
       if (this.pendingReset) {
         this.pendingReset = false;
@@ -462,8 +531,51 @@ export class AgentLoop {
 
   private async _runInner(
     userMessage: string,
-    emit: (event: AgentLoopEvent) => void
+    emit: (event: AgentLoopEvent) => void,
+    abortSignal: Promise<'aborted'>
   ): Promise<AgentLoopResult> {
+    // Race a promise against the run's abort signal. Original rejections are
+    // captured and rethrown (existing error paths unchanged); when the abort
+    // wins, the abandoned promise chain is already settled-capture-wrapped so
+    // it can never surface as an unhandled rejection.
+    const raceAbort = async <T>(p: Promise<T>): Promise<T | 'aborted'> => {
+      const raced = await Promise.race([
+        p.then(
+          (v) => ({ ok: true as const, v }),
+          (e: unknown) => ({ ok: false as const, e }),
+        ),
+        abortSignal,
+      ]);
+      if (raced === 'aborted') return 'aborted';
+      if (!raced.ok) throw raced.e;
+      return raced.v;
+    };
+
+    // Close out an aborted run. Pushes a model ack so `contents` stays
+    // alternation-valid no matter where the stop landed ([…user] or
+    // […user(functionResponses)]), then emits `aborted` + `final_text`.
+    const finishAborted = (iterationCount: number): AgentLoopResult => {
+      const reason: AbortReason = this.abortReason ?? 'user';
+      this.contents.push({
+        role: 'model',
+        parts: [
+          {
+            text:
+              reason === 'budget'
+                ? '(Stopped: turn time budget exceeded.)'
+                : '(Stopped by user.)',
+          },
+        ],
+      });
+      const text =
+        reason === 'budget'
+          ? `⏹ Stopped — this turn exceeded its ${Math.round(this.turnBudgetMs / 1000)}s time budget. ` +
+            'Partial work may have been applied; say "continue" to pick up where it left off, or undo via history.'
+          : '⏹ Stopped. Partial work may have been applied — say "continue" to pick up where it left off, or undo via history.';
+      emit({ type: 'aborted', iterations: iterationCount, reason });
+      emit({ type: 'final_text', iterations: iterationCount, text });
+      return { text, iterations: iterationCount, iterationLimitHit: false, aborted: reason };
+    };
     // Refresh "you are here" context once at the start of the turn. State
     // changes the agent makes during the turn will surface in tool results;
     // we don't pay for re-inspection per iteration.
@@ -513,6 +625,9 @@ export class AgentLoop {
     let extensionsGranted = 0;
     budget: for (;;) {
     while (iteration < effectiveMax) {
+      // A stop that landed between awaits (or right at turn start) — bail
+      // before spending another provider call.
+      if (this.abortReason) return finishAborted(iteration);
       iteration++;
 
       const sysText =
@@ -528,11 +643,11 @@ export class AgentLoop {
         tools: this.tools.length > 0 ? this.tools : undefined,
       };
 
-      let response;
+      let response: Awaited<ReturnType<AgentBackend['complete']>> | 'aborted';
       emit({ type: 'llm_call_start', iteration });
       try {
         try {
-          response = await this.backend.complete(request);
+          response = await raceAbort(this.backend.complete(request));
         } catch (err) {
           // The backend classifies provider failures into structural kinds
           // (BackendError.kind) — the loop's recovery policy keys on those,
@@ -550,10 +665,12 @@ export class AgentLoop {
           if (isShapeError && iteration === 1 && this.contents.length > 1) {
             const lastUser = this.contents[this.contents.length - 1];
             this.contents = lastUser ? [lastUser] : [];
-            response = await this.backend.complete({
-              ...request,
-              contents: [...this.contents],
-            });
+            response = await raceAbort(
+              this.backend.complete({
+                ...request,
+                contents: [...this.contents],
+              }),
+            );
           } else {
             throw err;
           }
@@ -563,6 +680,10 @@ export class AgentLoop {
         // its "thinking" indicator even when the backend throws.
         emit({ type: 'llm_call_end', iteration });
       }
+      // Stopped while the provider was thinking. No model turn was recorded,
+      // so contents still ends at the user turn — finishAborted's model ack
+      // keeps it valid. The abandoned provider call continues detached.
+      if (response === 'aborted') return finishAborted(iteration);
       // Track context pressure for the start-of-turn compaction trigger.
       if (typeof response.usageMetadata?.promptTokenCount === 'number') {
         this.lastPromptTokens = response.usageMetadata.promptTokenCount;
@@ -631,7 +752,8 @@ export class AgentLoop {
       // future, but keeping serial mirrors how an agent at the terminal
       // typically thinks one step at a time.
       const toolResponseParts: LLMPart[] = [];
-      for (const part of toolCallParts) {
+      for (let partIndex = 0; partIndex < toolCallParts.length; partIndex++) {
+        const part = toolCallParts[partIndex];
         const { name, args } = part.functionCall;
         this.callIdCounter += 1;
         const callId = `c${this.callIdCounter}`;
@@ -653,12 +775,54 @@ export class AgentLoop {
             line: chunk.line,
           });
         };
+        let raced: ToolExecutionResult | 'aborted';
         try {
-          result = await this.toolExecutor(name, args, onProgress);
+          raced = await raceAbort(this.toolExecutor(name, args, onProgress));
         } catch (err) {
           const stderr = err instanceof Error ? err.message : String(err);
-          result = { success: false, exitCode: -1, stdout: '', stderr };
+          raced = { success: false, exitCode: -1, stdout: '', stderr };
         }
+
+        if (raced === 'aborted') {
+          // Stopped mid-batch. The model turn with functionCall parts is
+          // already in `contents`, and Gemini requires a functionResponse
+          // for EVERY functionCall in it — so synthesize "stopped" responses
+          // for the in-flight call and every not-yet-started sibling, push
+          // them as the user turn, and close out. The in-flight handler
+          // keeps running detached (watchdog semantics); its effects surface
+          // via the mutation broadcast + next turn's ambient refresh.
+          const stoppedResult: ToolExecutionResult = {
+            success: false,
+            exitCode: -2,
+            stdout: '',
+            stderr:
+              'Stopped by the user before the tool finished. The operation may still complete in the background — re-inspect state before assuming it did not happen.',
+          };
+          emit({
+            type: 'tool_call_done',
+            iteration,
+            callId,
+            toolName: name,
+            toolArgs: args,
+            result: stoppedResult,
+          });
+          for (let rest = partIndex; rest < toolCallParts.length; rest++) {
+            const restName = toolCallParts[rest].functionCall.name;
+            const stderr =
+              rest === partIndex
+                ? stoppedResult.stderr
+                : 'Skipped: the run was stopped by the user before this call started.';
+            toolResponseParts.push({
+              functionResponse: {
+                name: restName,
+                response: { success: false, exitCode: -2, stdout: '', stderr },
+              },
+            });
+          }
+          this.contents.push({ role: 'user', parts: toolResponseParts });
+          return finishAborted(iteration);
+        }
+        result = raced;
 
         emit({
           type: 'tool_call_done',
@@ -722,7 +886,10 @@ export class AgentLoop {
     ) {
       break budget;
     }
-    const approved = await this.confirmContinueAtCap(iteration);
+    const approved = await this.confirmContinueAtCap(iteration, abortSignal);
+    // A stop during the continue-question is a stop, not a decline — the
+    // iteration-limit copy would misreport what happened.
+    if (this.abortReason) return finishAborted(iteration);
     if (!approved) break budget;
     extensionsGranted++;
     effectiveMax = Math.min(
@@ -748,15 +915,26 @@ export class AgentLoop {
    * returns the structured "not available" failure) or any throw counts as
    * a decline — never block the turn on a question nobody can answer.
    */
-  private async confirmContinueAtCap(iteration: number): Promise<boolean> {
+  private async confirmContinueAtCap(
+    iteration: number,
+    abortSignal: Promise<'aborted'>,
+  ): Promise<boolean> {
     try {
-      const result = await this.toolExecutor(ASK_USER_TOOL_NAME, {
-        question:
-          `I've used my step budget (${iteration} steps) and the task isn't finished. ` +
-          'Keep going?',
-        options: [CONTINUE_OPTION, STOP_OPTION],
-      });
-      if (!result.success) return false;
+      const result = await Promise.race([
+        this.toolExecutor(ASK_USER_TOOL_NAME, {
+          question:
+            `I've used my step budget (${iteration} steps) and the task isn't finished. ` +
+            'Keep going?',
+          options: [CONTINUE_OPTION, STOP_OPTION],
+        }).then(
+          (r) => r,
+          () => null,
+        ),
+        // Stop button while the question is pending → decline; the caller
+        // converts it to the aborted result via the abortReason check.
+        abortSignal.then(() => null),
+      ]);
+      if (!result || !result.success) return false;
       return isAffirmativeContinue(result.stdout);
     } catch {
       return false;
