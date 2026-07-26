@@ -104,7 +104,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const [pendingClarification, setPendingClarification] =
     useState<PendingClarification | null>(null);
   const pendingClarificationRef = useRef<PendingClarification | null>(null);
-  const turnCounterRef = useRef(0);
+  // Live turns must never share a turnId with restored (hydrated) entries —
+  // collapse toggling groups by turnId, so a collision would fold a new
+  // turn's rows into a restored one. Seed the counter above the restored max.
+  const turnCounterRef = useRef(
+    initialEntries.reduce((max, e) => Math.max(max, e.turnId), 0)
+  );
 
   useEffect(() => {
     pendingClarificationRef.current = pendingClarification;

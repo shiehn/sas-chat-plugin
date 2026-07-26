@@ -23,6 +23,7 @@
 import React, { useEffect, useRef, useState, type ComponentType } from 'react';
 import type {
   GeneratorPlugin,
+  LLMContent,
   PluginHost,
   PluginSettingsSchema,
   PluginSkill,
@@ -38,6 +39,8 @@ import { GeminiBackend, GEMINI_DEFAULT_MODEL } from './gemini-backend';
 import { ConversationStore } from './conversation-store';
 import type { PanelTools } from './panel-tools';
 import { ChatPanel } from './ui/ChatPanel';
+import { historyToEntries } from './ui/history-hydration';
+import type { TerminalEntry } from './ui/types';
 
 // Lazy-load the host-only deps. These pull in node:child_process via
 // sas-tool-handler, so importing them at module top would crash the renderer
@@ -213,6 +216,10 @@ interface ChatPluginRendererBridge {
   /** Optional — stop the in-flight agent turn (older preloads lack it; the
    *  stop button simply doesn't render then). */
   stop?(): Promise<unknown>;
+  /** Optional — fetch the restored conversation so the panel can render the
+   *  transcript the agent already remembers (app-restart continuity). Older
+   *  preloads lack it; the panel then mounts empty as before. */
+  getHistory?(): Promise<{ contents: LLMContent[] } | null>;
 }
 
 /**
@@ -230,11 +237,38 @@ function getBridge(): ChatPluginRendererBridge | null {
 const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }) => {
   const bridgeRef = useRef<ChatPluginRendererBridge | null>(null);
   const [bridgeAvailable, setBridgeAvailable] = useState<boolean>(true);
+  /** Restored-transcript entries; null while the (fast) history fetch is in
+   *  flight so ChatPanel mounts exactly once with its initialEntries. */
+  const [restoredEntries, setRestoredEntries] = useState<TerminalEntry[] | null>(null);
 
   useEffect(() => {
     const bridge = getBridge();
     bridgeRef.current = bridge;
     setBridgeAvailable(bridge !== null);
+
+    // App-restart continuity: the main-side AgentLoop reseeds its history
+    // from the ConversationStore, so fetch it and render the transcript the
+    // agent already carries. Old preloads (no getHistory) and any fetch
+    // failure degrade to the historical blank panel.
+    let cancelled = false;
+    const hydrate = async (): Promise<void> => {
+      if (!bridge?.getHistory) {
+        setRestoredEntries([]);
+        return;
+      }
+      try {
+        const history = await bridge.getHistory();
+        if (cancelled) return;
+        const contents = Array.isArray(history?.contents) ? history.contents : [];
+        setRestoredEntries(historyToEntries(contents).entries);
+      } catch {
+        if (!cancelled) setRestoredEntries([]);
+      }
+    };
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Reset on scene change is handled main-side via onSceneChanged.
@@ -288,10 +322,22 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }
     );
   }
 
+  // Hold mounting until the history fetch settles (one fast IPC round-trip)
+  // — ChatPanel consumes initialEntries at mount, so mounting early would
+  // lose the restored transcript.
+  if (restoredEntries === null) {
+    return React.createElement(
+      'div',
+      { style: { padding: 12, color: 'var(--sas-text-muted, #888)' } },
+      'Restoring conversation…'
+    );
+  }
+
   return React.createElement(ChatPanel, {
     sendMessage,
     sendClarificationResponse,
     onStop: canStop ? handleStop : undefined,
+    initialEntries: restoredEntries,
     isExpanded,
   });
 };
@@ -304,7 +350,7 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }
 export class ChatPanelPlugin implements GeneratorPlugin {
   readonly id = CHAT_PANEL_PLUGIN_ID;
   readonly displayName = 'Chat';
-  readonly version = '2.3.0';
+  readonly version = '2.4.0';
   readonly description =
     'AI-powered audio manipulation via natural language — drives the sas CLI like Claude Code at the terminal (scene-scoped).';
   readonly generatorType = 'hybrid' as const;
@@ -456,6 +502,15 @@ export class ChatPanelPlugin implements GeneratorPlugin {
    */
   stop(): void {
     this.agent?.abort('user');
+  }
+
+  /**
+   * Conversation snapshot for the renderer's restart hydration
+   * (chat-plugin:get-history IPC). Read-only deep copy; empty when no agent
+   * has been built yet (nothing restored → nothing to show).
+   */
+  getHistorySnapshot(): LLMContent[] {
+    return this.agent?.getHistorySnapshot() ?? [];
   }
 
   async deactivate(): Promise<void> {
