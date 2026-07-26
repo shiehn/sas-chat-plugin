@@ -120,7 +120,7 @@ function resolveTransport(
  * of these on every producer-loop turn (job polling, verify, inspect,
  * checkpoint/undo, transitions, deck transport, save). Promotion is DATA —
  * trim per Errantry friction diff. Each entry costs prompt tokens on every
- * request (~13 tools ≈ +3.3–4.5k tokens), so promote sparingly.
+ * request (~15 tools ≈ +3.8–5k tokens), so promote sparingly.
  */
 export const PROMOTED_PROJECT_TOOLS: readonly string[] = [
   'get_job_status',
@@ -138,6 +138,13 @@ export const PROMOTED_PROJECT_TOOLS: readonly string[] = [
   'deck_play',
   'deck_stop',
   'project_save',
+  // FX READS (2026-07 curation fix): the default surface carried the FX
+  // WRITES (dsl_set_track_fx / dsl_fx_set_param / dsl_fx_remove) while both
+  // reads sat behind tool_search — the agent could mutate a rack it couldn't
+  // look at. Scene-scoped but deferred, so the scene scan misses them; the
+  // promotion scan (includeDeferred) picks them up.
+  'dsl_get_track_fx',
+  'fx_list_plugins',
 ];
 
 export async function buildPanelTools(
