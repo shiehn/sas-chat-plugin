@@ -26,6 +26,7 @@ import type {
   LLMTool,
   LLMFunctionDeclaration,
 } from '@signalsandsorcery/plugin-sdk';
+import { tryParseTimeSignature } from '@signalsandsorcery/plugin-sdk';
 import { invokeSas } from './sas-tool-handler';
 import type { AgentNextStep, ToolExecutor, ToolExecutionResult } from './agent-loop';
 import {
@@ -1174,6 +1175,40 @@ interface AmbientHistory {
  *
  *  Equivalent to Claude Code injecting `git status` + tree + CLAUDE.md every
  *  turn — cheap recurring context beats expensive recovery via tool calls. */
+/**
+ * Per-scene time signatures via ONE read-only `db_query` (P8b
+ * multi-time-signature). Best-effort meter enrichment: any failure — tool
+ * missing, host mock without db_query, query error — returns an empty map
+ * and every scene is treated as 4/4, leaving the preamble byte-identical
+ * to the pre-meter output. NULL `time_signature` rows (pre-Migration-078
+ * scenes) also read as 4/4.
+ */
+async function readSceneMeters(host: PluginHost, projectId: string): Promise<Map<string, string>> {
+  const meters = new Map<string, string>();
+  try {
+    const res = await host.executeAppTool('db_query', {
+      sql: 'SELECT id, time_signature FROM loop_sections WHERE project_id = ?',
+      params: [projectId],
+      limit: 64,
+    });
+    if (!res.success) return meters;
+    const op = isRecord(res.data) ? res.data : null;
+    const changes = op && isRecord(op.changes) ? op.changes : null;
+    const rows = changes && Array.isArray(changes.rows) ? changes.rows : [];
+    for (const row of rows) {
+      if (!isRecord(row) || typeof row.id !== 'string') continue;
+      const ts =
+        typeof row.time_signature === 'string' && row.time_signature !== ''
+          ? row.time_signature
+          : '4/4';
+      meters.set(row.id, ts);
+    }
+  } catch {
+    /* meter enrichment is best-effort — absent = 4/4 */
+  }
+  return meters;
+}
+
 export async function buildAmbientContext(host: PluginHost): Promise<string> {
   // Cache fast-path. The same active scene with no observed mutations
   // (preferred) or a recent compute (TTL fallback) returns the cached
@@ -1244,6 +1279,12 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
     const ledger = await readTaskLedger(host);
     const journalBody = await readProjectJournal(host);
     const preferences = await readPreferences(host);
+    // Scene meters (P8b): rendered ONLY for non-4/4 scenes, so all-4/4
+    // projects keep a byte-identical preamble (token thrift + cache pins).
+    const sceneMeters =
+      project && typeof project.id === 'string'
+        ? await readSceneMeters(host, project.id)
+        : new Map<string, string>();
 
     const lines: string[] = ['=== Current state (auto-refreshed each turn) ==='];
 
@@ -1292,7 +1333,15 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
           ? `${rawChords.slice(0, 80)}…`
           : rawChords
         : 'none';
-      lines.push(`Active scene contract: key=${key} bpm=${bpm} chords=${chords}`);
+      // Meter shown ONLY when non-4/4 (byte-stability for 4/4 projects),
+      // with the derived qn-per-bar so the agent needn't do meter math.
+      const activeMeter = sceneMeters.get(activeSceneId);
+      const qnPerBar = activeMeter ? tryParseTimeSignature(activeMeter)?.quarterNotesPerBar : undefined;
+      const meterPart =
+        activeMeter && activeMeter !== '4/4' && qnPerBar !== undefined
+          ? ` meter=${activeMeter} (${qnPerBar} quarter notes/bar; BPM counts quarter notes)`
+          : '';
+      lines.push(`Active scene contract: key=${key} bpm=${bpm}${meterPart} chords=${chords}`);
     }
 
     // Session goals — what we're working on this session. Backed by
@@ -1349,7 +1398,10 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
       for (const s of visible) {
         const name = s.displayName ?? s.name ?? '(unnamed)';
         const idStr = typeof s.id === 'string' ? s.id : '<unknown>';
-        lines.push(`  - "${name}"  →  id = ${idStr}`);
+        // Meter suffix ONLY for non-4/4 scenes — 4/4 lines stay byte-identical.
+        const meter = typeof s.id === 'string' ? sceneMeters.get(s.id) : undefined;
+        const meterSuffix = meter && meter !== '4/4' ? `  [time signature ${meter}]` : '';
+        lines.push(`  - "${name}"  →  id = ${idStr}${meterSuffix}`);
       }
       if (scenes.length > AMBIENT_MAX_SCENES) {
         lines.push(`  - (+${scenes.length - AMBIENT_MAX_SCENES} more — call sas_inspect_project for the full list)`);

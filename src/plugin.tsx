@@ -126,6 +126,7 @@ What S&S is, at a domain level (use this vocabulary when the user asks "what is 
 - Role: the track's musical purpose. Canonical roles (plural form): bass, keys, lead, pads, strings, brass, winds, bells, plucked, arp, chords, drums, kicks, snares, hats, 808s, perc, cymbals, atmospheres, fx, vocals. Drives generation prompts and preset categories.
 - Plugin: the generator that owns a track. Built-in: \`@signalsandsorcery/synth-generator\` (Surge-synth MIDI tracks), \`@signalsandsorcery/drum-generator\` (sample-based drum patterns — real one-shot drum samples), \`@signalsandsorcery/instrument-generator\` (pitched, sample-based instruments — plucks/keys/pads/bass), \`loops\` (audio samples / loops), \`stems\` (long-form audio with optional stem splitting).
 - Musical context (a.k.a. "contract"): per-scene key, BPM, chord progression, genre. Inferred by \`compose_contract\` or \`compose_scene\` from the user's description.
+- Time signature (meter): every scene has one, as "N/D" (default 4/4; also 3/4, 6/8, 7/8, …). BPM ALWAYS counts QUARTER notes, in every meter; a bar spans numerator×4/denominator quarter notes (6/8 → 3 qn, 7/8 → 3.5 qn), and chord grids have numerator slots per bar (one per denominator beat). Set it with \`scene_set_time_signature\` BEFORE composing — the meter locks together with the contract once the scene has tracks (\`sas_inspect_scene\` shows it). Transitions may bridge scenes in DIFFERENT meters; like the key, a transition is authored in the TARGET scene's meter. Plugins that don't declare support for a scene's meter appear disabled in that scene.
 - Deck LOOP-A ("cue"): headphone output, channels 1-2. The composition deck — what you're working on. Plays one scene OR one transition at a time.
 - Deck LOOP-B ("performance" / "main"): main speaker output, channels 3-4. What the audience hears. Independent of LOOP-A; same content contract.
 - Playback mode (derived from audio routing): Performance mode (4+ channels with separate cue/main pairs) keeps decks isolated. Solo mode (≤2 channels) makes them mutually exclusive.
@@ -350,7 +351,7 @@ const ChatPanelUI: ComponentType<PluginUIProps> = ({ activeSceneId, isExpanded }
 export class ChatPanelPlugin implements GeneratorPlugin {
   readonly id = CHAT_PANEL_PLUGIN_ID;
   readonly displayName = 'Chat';
-  readonly version = '2.4.0';
+  readonly version = '2.5.0';
   readonly description =
     'AI-powered audio manipulation via natural language — drives the sas CLI like Claude Code at the terminal (scene-scoped).';
   readonly generatorType = 'hybrid' as const;
