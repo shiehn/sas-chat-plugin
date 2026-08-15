@@ -139,12 +139,11 @@ export const PROMOTED_PROJECT_TOOLS: readonly string[] = [
   'deck_play',
   'deck_stop',
   'project_save',
-  // FX READS (2026-07 curation fix): the default surface carried the FX
-  // WRITES (dsl_set_track_fx / dsl_fx_set_param / dsl_fx_remove) while both
-  // reads sat behind tool_search — the agent could mutate a rack it couldn't
-  // look at. Scene-scoped but deferred, so the scene scan misses them; the
-  // promotion scan (includeDeferred) picks them up.
-  'dsl_get_track_fx',
+  // FX READ (2026-07 curation fix): the default surface carried the FX
+  // WRITES (dsl_fx_set_param / dsl_fx_remove) while the rack read sat behind
+  // tool_search — the agent could mutate a rack it couldn't look at.
+  // Scene-scoped but deferred, so the scene scan misses it; the promotion
+  // scan (includeDeferred) picks it up.
   'fx_list_plugins',
 ];
 
