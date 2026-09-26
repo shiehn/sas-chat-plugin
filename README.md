@@ -8,6 +8,8 @@ A [Signals & Sorcery](https://signalsandsorcery.com) plugin that adds a natural-
 
 > Part of the **[Signals & Sorcery](https://signalsandsorcery.com)** ecosystem.
 
+> **Direction:** [`docs/NORTH-STAR.md`](docs/NORTH-STAR.md) sets out what this chat interface is for. In short: control all of S&S by text, with the UI showing each change exactly as a click would, and interpret high-level musical direction using agent skills rather than hard-coded recipes. It also holds the pillars, the scenario suite and the scorecard.
+
 ## What it does
 
 A built-in [`GeneratorPlugin`](https://github.com/shiehn/sas-plugin-sdk) that runs an agentic loop in the Electron main process:

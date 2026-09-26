@@ -29,6 +29,7 @@ import type {
   PluginSkill,
   PluginUIProps,
 } from '@signalsandsorcery/plugin-sdk';
+import { LLM_MODEL } from '@signalsandsorcery/plugin-sdk';
 import type {
   AgentLoop,
   AgentLoopEvent,
@@ -355,7 +356,7 @@ export class ChatPanelPlugin implements GeneratorPlugin {
   readonly description =
     'AI-powered audio manipulation via natural language — drives the sas CLI like Claude Code at the terminal (scene-scoped).';
   readonly generatorType = 'hybrid' as const;
-  readonly minHostVersion = '2.4.0';
+  readonly minHostVersion = '3.17.0'; // LLM_MODEL role aliases resolved by the host
 
   private host: PluginHost | null = null;
   private agent: AgentLoop | null = null;
@@ -566,8 +567,8 @@ export class ChatPanelPlugin implements GeneratorPlugin {
             'Gemini model driving the chat agent. Pro is the strongest at multi-step tool use; Flash is faster and cheaper for simple asks.',
           default: GEMINI_DEFAULT_MODEL,
           options: [
-            { label: 'Gemini 3.1 Pro (best tool use)', value: GEMINI_DEFAULT_MODEL },
-            { label: 'Gemini 2.5 Flash (faster)', value: 'gemini-2.5-flash' },
+            { label: 'Best (Gemini Pro — strongest tool use)', value: LLM_MODEL.BEST },
+            { label: 'Lightweight (Gemini Flash-Lite — faster, cheaper)', value: LLM_MODEL.LIGHTWEIGHT },
           ],
         },
       },

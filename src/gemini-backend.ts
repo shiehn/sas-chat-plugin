@@ -9,11 +9,13 @@
  */
 
 import type { PluginHost, LLMToolUseRequest, LLMToolUseResponse } from '@signalsandsorcery/plugin-sdk';
+import { LLM_MODEL } from '@signalsandsorcery/plugin-sdk';
 import { AgentBackend, AgentBackendCapabilities, BackendError, BackendErrorKind } from './backend';
 
-export const GEMINI_DEFAULT_MODEL = 'gemini-3.1-pro-preview';
+/** Role aliases (SDK 3.17.0): the HOST maps them to the current Gemini ids — no version pinned here. */
+export const GEMINI_DEFAULT_MODEL: string = LLM_MODEL.BEST;
 /** Lightweight tier for compaction summarization — cheap, fast, no tools. */
-export const GEMINI_COMPACTION_MODEL = 'gemini-2.5-flash';
+export const GEMINI_COMPACTION_MODEL: string = LLM_MODEL.LIGHTWEIGHT;
 
 /**
  * Classify a raw provider error into a `BackendError`. Exported for tests.

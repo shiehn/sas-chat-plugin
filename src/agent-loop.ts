@@ -214,10 +214,10 @@ export interface AgentLoopOptions {
    * policy on `BackendError.kind`, never on provider error text.
    */
   backend?: AgentBackend;
-  /** Model id. Default: the backend's `defaultModel` ('gemini-3.1-pro-preview'
-   *  for the default GeminiBackend — Google's flagship agentic-tool-use model,
-   *  Feb 2026; older 2.5-pro is materially weaker at recovering from
-   *  structured tool errors). */
+  /** Model role or id. Default: the backend's `defaultModel` (`LLM_MODEL.BEST`
+   *  for the default GeminiBackend — the host resolves it to the current
+   *  Gemini Pro, Google's strongest agentic-tool-use model; Flash-class models
+   *  are materially weaker at recovering from structured tool errors). */
   model?: string;
   /** Iteration cap. Default: 25. Older default of 10 frequently exhausted on
    *  composite intents (compose_scene → tweak → preview); 25 leaves headroom
