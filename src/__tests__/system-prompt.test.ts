@@ -123,6 +123,10 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     }
     // Separate undo history — the agent must not reach for history undo.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_undo` \(its own history/);
+    // S-082: the edit tools resolve names, so no mandatory arrangement_get
+    // id-lookup hop before every edit.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/They take NAMES directly/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/arrangement_get` FIRST/);
   });
 
   it('routes song export to arrangement_export, not the scene or cloud export paths', () => {
