@@ -84,7 +84,12 @@ The word "skill" was overloaded. From now on:
   - The last trustworthy run was on 2026-05-17 and passed 22 of 113.
   - The July baselines (`latest.json` 2026-07-03: 5 of 120; 2026-07-27: 0 of 80) failed on the environment, with
     about 1 s per test, 0 iterations and 0 tool calls. They measure nothing.
-  - Restoring a green, trustworthy Errantry-PI run comes before any score in §6 can be believed.
+  - **2026-09-27 re-run (live app, bridge up, preflight healthy): invalid again.** Only 4 of 120 tests reached the
+    agent. 106 failed on `Token limit exceeded` and the seeds on "Daily token quota exceeded for your Paid plan".
+    The validity gate correctly refused to update `latest.json`.
+  - **The blocker is structural.** The gateway's per-user daily token budget can't fit one full PI run, let alone
+    the North-Star scenarios run 3× each. P5 can't be met until there is an eval budget path. That is a gateway
+    decision.
 
 ## 5. North-Star scenario suite
 
@@ -142,7 +147,8 @@ Runs are appended here, and each column is a run. `—` means the scenario hasn'
 capability it needs doesn't exist yet.
 
 Reference: the last trustworthy Errantry-PI run (2026-05-17, pre-charter suite) passed 22 of 113. The July
-baselines failed on the environment, and there is no live run yet for this charter.
+baselines and the 2026-09-27 re-run all hit the gateway's daily token quota and measured nothing. There is no live
+run for this charter yet.
 
 | ID | 2026-09-26 (code-read) |
 |----|------------------------|
@@ -170,3 +176,27 @@ Each phase ends with every touched repo's test suite green and the scorecard re-
 | 4 | **Skill content.** Core skills (generator routing, beat construction, bassline, harmony, melody, arrangement, mixing, sound design, transitions, genre reinterpretation) plus genre packs. The system prompt slims from ~17K to ~9.5K chars and gains a skill protocol. | sas-app/skills; chat plugin |
 | 5 | **Composites stop hard-coding taste.** A track realizer that routes to the owning plugin; `add_tracks` for the current scene; no default roles; `revise_*` routes to the owning plugin. | sas-app |
 | 6 | **Total coverage.** SDK `invokeSkill()` plus headless panel-core, so plugins dispatch their own actions. Actions and skills for bass, arp, pad, ensemble, vocals, texture… The ledgers count plugin panels. | SDK; plugin fleet; sas-app |
+
+### Status (2026-09-27)
+
+Committed in `dc2d090`: the charter, WO-NS0 and WO-NS1. Everything else below is uncommitted.
+
+- **Phase 0:**
+  - The charter and the scenario suite are written.
+  - The live baseline is **blocked by the gateway's daily token quota** (see §4 P5). The eval budget proposal is
+    tracked privately and needs Steve's decision.
+- **Phases 2 and 3, SDK side: done in SDK 3.20.0.**
+  - Agent-skill contract: `getAgentSkills`, `PluginAgentSkill`, `listAgentSkills` / `readAgentSkill`, plus the
+    limits, validation and `{{action:x}}` helpers.
+  - Auto-reveal hooks: `TrackRow` `data-track-id` / `data-track-db-id`, `onRevealRequest`, and panel-core opens the
+    drawer tab. The drum, instrument and loops panels pass `dbId` too.
+  - The whole fleet was verified against 3.20.0: 16 of 16 pass.
+- **Host work orders**, all in `work-orders/`:
+  - WO-NS0: the scenario specs.
+  - WO-NS1: visual truth.
+  - WO-NS2: view control + reveal.
+  - WO-NS3: the agent-skill registry.
+  - WO-NSE: the eval budget (tracked privately).
+- **Next on the chat-plugin side:**
+  - Build the skill index from `listAgentSkills`, and exempt `skill_load` from truncation (lands with WO-NS3).
+  - Phase 4: skill content and slimming the prompt.

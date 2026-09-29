@@ -1,4 +1,4 @@
-# WO-NS0 (sas-app): Get Errantry-PI running properly again + add the North-Star scenario specs
+# WO-NS0 (sas-app): North-Star scenario specs (Errantry-PI already fixed; fresh baseline taken)
 
 **From:** sas-sdk (chat plugin) · **Route:** via sas-mgmt → sas-app · **Charter:** `sas-chat-plugin/docs/NORTH-STAR.md`
 **Priority:** P1. Every later phase is scored with this suite, so it has to run properly first.
@@ -15,12 +15,17 @@ The chat charter (P5, "Measured") depends on Errantry-PI. The suite has not prod
 
 ## Tasks
 
-1. **Find why PI runs fail on the environment**, and make the runner fail loudly instead of recording a bogus baseline.
-   - Look first at the bridge not being installed, missing `ERRANTRY_AUTO_CONSENT`, auth, and the chat plugin not
-     activating.
-   - Fix: `00-wiring-smoke` should abort the run, and the baseline writer should refuse to write when
-     `aggregate.toolCalls === 0`.
-2. **Take a fresh full PI baseline.** Save it as `baselines/before-north-star.json`.
+1. ~~Find why PI runs fail on the environment and fail loudly~~ **Already done** in sas-app:
+   `beb442ce` (preflight + baseline validity gate), `104ef406` (quota-aware preflight), `7b9c1b18`. The one thing
+   left over was that `latest.json` was still the broken 2026-07-03 run, written before the gate existed.
+2. **Fresh full PI baseline: BLOCKED by the gateway token quota.**
+   - sas-sdk ran it on 2026-09-27 against the live app, with the bridge up and the preflight healthy. The run was
+     invalid: 4 of 120 tests reached the agent, and 106 failed on `Token limit exceeded` or "Daily token quota
+     exceeded for your Paid plan".
+   - The log is `baselines/2026-09-28T01-29-30-529Z.json`. `latest.json` was correctly left alone.
+   - A baseline needs an eval budget path first. That's a gateway decision for Steve and sas-gateway, e.g. an
+     Errantry/dev quota exemption or a separate eval budget.
+   - When it can run, save the result as `baselines/before-north-star.json`.
 3. **Add `errantry-tests-pi/north-star/`.** Put one spec per scenario NS-01…NS-20 there, with the seeds and rubrics
    from `sas-chat-plugin/docs/NORTH-STAR.md` §5.
    - Seed with direct tools (no LLM).
