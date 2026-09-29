@@ -104,6 +104,27 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/add_instrument/);
   });
 
+  it('routes song-timeline asks to the arrangement tools, not the LOOP-B queue', () => {
+    // Local Arranger (S-060/S-061): project-scoped + deferred, so tool_search
+    // reaches them — the prompt names them so "put the chorus twice after the
+    // verse" doesn't land on performance_stack_* (also "per-slot repeats").
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Arrangement:/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT the LOOP-B queue/);
+    for (const name of [
+      'arrangement_get',
+      'arrangement_insert_instance',
+      'arrangement_duplicate_instance',
+      'arrangement_set_layer',
+      'arrangement_start',
+      'arrangement_play',
+      'arrangement_undo',
+    ]) {
+      expect(DEFAULT_SYSTEM_PROMPT).toContain(name);
+    }
+    // Separate undo history — the agent must not reach for history undo.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_undo` \(its own history/);
+  });
+
   it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {
     // The agent has historically fumbled ambiguous selectors; the prompt
     // must spell out the contract: when a tool returns clarification_needed,
