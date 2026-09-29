@@ -125,6 +125,16 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_undo` \(its own history/);
   });
 
+  it('routes song export to arrangement_export, not the scene or cloud export paths', () => {
+    // S-062: the legacy LOOP-B export_arrangement is retired; arrangement_export
+    // is an async job (Mix / Master preset / stems / editable stems / Ableton).
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_export');
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_export_cancel');
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_export` \(a job — wait with `wait_for_job`/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT `export_audio` \/ `ableton_export_\*`/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/\bexport_arrangement\b/);
+  });
+
   it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {
     // The agent has historically fumbled ambiguous selectors; the prompt
     // must spell out the contract: when a tool returns clarification_needed,
