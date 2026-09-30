@@ -202,6 +202,47 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/those bars go SILENT, the song doesn't get shorter/);
   });
 
+  it('teaches clips (split / join / the clip selector) and whole-section fades', () => {
+    // S-118 (D-054, D-055 "Split at sections"): every section boundary is a
+    // clip edge and a pasted / duplicated piece is its own clip, so "delete
+    // the second copy of the kick" is one clip, not the whole run.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/every section boundary is a clip edge, and a pasted or duplicated piece is its own clip/);
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_split');
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_join');
+    // Split refuses a section start; join never removes a section edge.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/a section start is already an edge, so it is refused/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/it can't join across a section start/);
+    // The clip selector on copy / delete_region / duplicate, vs run.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(
+      /`arrangement_copy` \/ `arrangement_delete_region` \/ `arrangement_duplicate` take `clip` \{track, instance\? \| bar\?\} = the clip under that bar/,
+    );
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"delete the second copy of the kick" → `arrangement_delete_region` \{clip: \{track: "kick", bar: 17\}\}/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/vs `run` = the layer's whole continuous stretch across sections/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`arrangement_get` lists each layer's splits/);
+    // S-101: fade a whole section; 0 removes; one layer stays set_layer's job.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`arrangement_fade_section` \(`instance` by name, `edge` in\|out, `bars` or `beats` — 0 removes the fades\)/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/starts at the section's first bar \(in\) or ends at its last \(out\)/);
+  });
+
+  it('names only registered arrangement_* tools', () => {
+    // Mirror of sas-app's registered arrangement_* tool names (src/main/tools,
+    // as of S-118). A name the prompt invents sends the agent to a
+    // tool_search dead end; add to this list only after the tool ships.
+    const registered = new Set([
+      'arrangement_start', 'arrangement_play', 'arrangement_stop', 'arrangement_status', 'arrangement_seek',
+      'arrangement_loop_instance', 'arrangement_get', 'arrangement_insert_instance', 'arrangement_move_instance',
+      'arrangement_duplicate_instance', 'arrangement_delete_instance', 'arrangement_resize_instance',
+      'arrangement_set_layer', 'arrangement_fade_section', 'arrangement_place_treatment',
+      'arrangement_remove_treatment', 'arrangement_copy', 'arrangement_paste', 'arrangement_delete_region',
+      'arrangement_duplicate', 'arrangement_split', 'arrangement_join', 'arrangement_undo', 'arrangement_redo',
+      'arrangement_export', 'arrangement_export_cancel', 'arrangement_sync_status', 'arrangement_sync',
+      'arrangement_import_proposal', 'arrangement_share',
+    ]);
+    const named = DEFAULT_SYSTEM_PROMPT.match(/\barrangement_[a-z_]+/g) ?? [];
+    expect(named.length).toBeGreaterThan(0);
+    expect(named.filter((n) => !registered.has(n))).toEqual([]);
+  });
+
   it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {
     // The agent has historically fumbled ambiguous selectors; the prompt
     // must spell out the contract: when a tool returns clarification_needed,
