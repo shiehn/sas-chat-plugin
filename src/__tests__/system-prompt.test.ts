@@ -154,6 +154,16 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT the cloud `arranger_\*` draft tools/);
   });
 
+  it('routes per-instance treatments to arrangement_place/remove_treatment, user-requested only', () => {
+    // S-094: the editor's treatment palette (types from the contract's
+    // TREATMENT_SPECS — the tool description enumerates them, the prompt
+    // names families only). Nothing is automatic.
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_place_treatment');
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_remove_treatment');
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/a riser resolves at the END of its bar/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Place ONLY what the user asks for/);
+  });
+
   it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {
     // The agent has historically fumbled ambiguous selectors; the prompt
     // must spell out the contract: when a tool returns clarification_needed,
