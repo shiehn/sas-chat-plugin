@@ -164,6 +164,20 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Place ONLY what the user asks for/);
   });
 
+  it('routes copy / paste / duplicate / clear to the arrangement clipboard tools', () => {
+    // S-097: the editor's session clipboard (⌘C / ⌘V / ⌘D / Delete).
+    for (const name of [
+      'arrangement_copy',
+      'arrangement_paste',
+      'arrangement_duplicate`',
+      'arrangement_delete_region',
+    ]) {
+      expect(DEFAULT_SYSTEM_PROMPT).toContain(name);
+    }
+    // delete_region silences bars — it never removes time.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/those bars go SILENT, the song doesn't get shorter/);
+  });
+
   it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {
     // The agent has historically fumbled ambiguous selectors; the prompt
     // must spell out the contract: when a tool returns clarification_needed,
