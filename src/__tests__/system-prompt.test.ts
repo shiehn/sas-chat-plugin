@@ -140,8 +140,9 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
   });
 
   it('routes arrangement sync / import / share to the local arrangement_* tools, not the cloud arranger_*', () => {
-    // S-065: sync of the LOCAL arrangements; proposals are imported as a new
-    // arrangement, never auto-applied.
+    // S-065: sync of the project's LOCAL arrangement; proposals are never
+    // auto-applied. S-105 (D-051): importing one REPLACES the project's
+    // arrangement as one undoable step (no new local arrangement any more).
     for (const name of [
       'arrangement_sync_status',
       'arrangement_sync',
@@ -152,6 +153,29 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     }
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_share` \(action get\|create\|rotate\|revoke/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT the cloud `arranger_\*` draft tools/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(
+      /arrangement_import_proposal` \(a draftId from the sync status → it REPLACES the project's arrangement as ONE undoable step: `arrangement_undo` brings the previous version back; the variant library is kept\)/,
+    );
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/a NEW local arrangement/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/the original is untouched/);
+  });
+
+  it('teaches one arrangement per project (D-051): no lifecycle tools, no arrangementId', () => {
+    // S-105 removed arrangement_list / _create / _rename / _delete / _select;
+    // every arrangement tool acts on the project's arrangement and ignores
+    // arrangementId. A missing arrangement is seeded by arrangement_start.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/A project has exactly ONE arrangement, bound to its composition/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/every arrangement tool acts on it without an arrangement id/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/if the project has none yet, `arrangement_start` seeds it/);
+    // \b after the verb keeps the live arrangement_delete_instance /
+    // arrangement_delete_region from matching the removed arrangement_delete.
+    for (const removed of ['list', 'create', 'rename', 'delete', 'select']) {
+      expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(new RegExp(`\\barrangement_${removed}\\b`));
+    }
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/arrangementId/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/\barrangements\b/);
+    // S-108 instance labels: "Chorus" once, "Chorus (1)" / "Chorus (2)" repeated.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"Chorus \(1\)" \/ "Chorus \(2\)" when it repeats/);
   });
 
   it('routes per-instance treatments to arrangement_place/remove_treatment, user-requested only', () => {
