@@ -139,6 +139,21 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/\bexport_arrangement\b/);
   });
 
+  it('routes arrangement sync / import / share to the local arrangement_* tools, not the cloud arranger_*', () => {
+    // S-065: sync of the LOCAL arrangements; proposals are imported as a new
+    // arrangement, never auto-applied.
+    for (const name of [
+      'arrangement_sync_status',
+      'arrangement_sync',
+      'arrangement_import_proposal',
+      'arrangement_share',
+    ]) {
+      expect(DEFAULT_SYSTEM_PROMPT).toContain(name);
+    }
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_share` \(action get\|create\|rotate\|revoke/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT the cloud `arranger_\*` draft tools/);
+  });
+
   it('teaches the clarification recovery contract (clarification_needed → ask_user)', () => {
     // The agent has historically fumbled ambiguous selectors; the prompt
     // must spell out the contract: when a tool returns clarification_needed,
