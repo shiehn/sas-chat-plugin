@@ -224,6 +224,29 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/starts at the section's first bar \(in\) or ends at its last \(out\)/);
   });
 
+  it('teaches arrangement_set_layer fade shapes and the gain envelope (the wave edit view)', () => {
+    // S-104 (D-050 "fades + gain only"): fadeInCurve / fadeOutCurve take the
+    // four shapes, and a shape sent alone re-shapes the existing fade.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(
+      /`arrangement_set_layer` for one layer in one instance \(play off, fromBar\/toBar, fades, gainDb; fade shapes `fadeInCurve` \/ `fadeOutCurve` equalPower \(the default\) \| linear \| exponential \| sCurve/,
+    );
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/a shape alone re-shapes the existing fade/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"make the pad's fade-out an S-curve" → fadeOutCurve: "sCurve", no fadeOutBeats/);
+    // gainEnvelope: quarter-note beats from the instance's start, linear in dB,
+    // held past the ends, so a dip needs 0 dB anchors on both sides.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/a gain envelope `gainEnvelope` \[\{beat, db\}\]/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/beats are quarter notes from the instance's start, linear in dB between points and held past the ends/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/so a dip needs 0 dB points around it/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/±24 dB on top of gainDb, \[\] clears/);
+    expect(DEFAULT_SYSTEM_PROMPT).toContain(
+      '"duck the bass by 6 dB in bars 3-4 of the chorus" (4/4) → [{beat: 7, db: 0}, {beat: 8, db: -6}, {beat: 16, db: -6}, {beat: 17, db: 0}]',
+    );
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`arrangement_get` shows both\)/);
+    // Whole-section fades stay equal-power on arrangement_fade_section; shapes
+    // are a per-layer edit only.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/One layer's fades stay with `arrangement_set_layer`/);
+  });
+
   it('names only registered arrangement_* tools', () => {
     // Mirror of sas-app's registered arrangement_* tool names (src/main/tools,
     // as of S-118). A name the prompt invents sends the agent to a
