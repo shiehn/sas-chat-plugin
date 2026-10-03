@@ -134,8 +134,8 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
   });
 
   it('routes arrangement row mute / solo / restore and the loop to the arranger tools', () => {
-    // Song-wide row M / S are the arranger's own (not composer mutes); one
-    // instance's layer stays set_layer. Looping is ON over the whole song by
+    // Song-wide row M / S are the arranger's own, per view (S-210: Compose's
+    // mutes / solos never reach it); one instance's layer stays set_layer. Looping is ON over the whole song by
     // default; a pending play starts by itself.
     for (const name of [
       'arrangement_set_track_mute',
@@ -193,8 +193,12 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"why can't I insert the Verse on the web"/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`webPrep` = the background preparation that renders every scene so it is insertable on the web/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/prepareAllScenes \/ pausePreparation/);
-    // S-198: a muted panel bus in Compose is a silentRows reason too.
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/a composer mute — of the track or of its panel bus — silences a row here too/);
+    // S-210 (D-090) superseded S-198: mute / solo are per view — Compose's
+    // mutes (track or bus) no longer silence an arrangement row.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/only the arranger's own M \/ S silence a row here; each entry says why: row-muted or other-row-soloed/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Mute \/ solo are PER VIEW/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Compose's mutes \/ solos \/ bus mutes never touch it/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/composer mute[^.;]*silences a row here/);
   });
 
   it('teaches one arrangement per project (D-051): no lifecycle tools, no arrangementId', () => {
