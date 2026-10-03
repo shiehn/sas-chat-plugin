@@ -123,6 +123,10 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     }
     // Separate undo history — the agent must not reach for history undo.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_undo` \(its own history/);
+    // P2: own-only undo — "undo what I did on my phone" must use fromOtherDevice.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/it undoes only THIS desktop's own edits/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/To undo a change made on the phone \/ the web, pass fromOtherDevice: true/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`arrangement_sync_status` lastRemote names that batch/);
     // S-082: the edit tools resolve names, so no mandatory arrangement_get
     // id-lookup hop before every edit.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/They take NAMES directly/);
