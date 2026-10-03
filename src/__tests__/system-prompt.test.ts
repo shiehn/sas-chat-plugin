@@ -147,6 +147,12 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Playback LOOPS the whole arrangement by default/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/pending: true — it is preparing and starts by itself; don't call play again/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/deferred_until_stop: tell the user it opens once playback stops/);
+    // S-192: the composition's stops never stop a playing arrangement —
+    // deck_stop is on the default surface, arrangement_stop is deferred.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(
+      /stop it with `arrangement_stop` \(the composition's `deck_stop` \/ `dsl_stop` never stop the arrangement\)/,
+    );
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`arrangement_status` playPending/);
   });
 
   it('routes song export to arrangement_export, not the scene or cloud export paths', () => {
