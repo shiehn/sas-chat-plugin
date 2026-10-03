@@ -184,6 +184,13 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     );
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/a NEW local arrangement/);
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/the original is untouched/);
+    // S-200: web insertability depends on the background scene preparation —
+    // webPrep (sync_status / sync) answers "why can't I insert X on the web".
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"why can't I insert the Verse on the web"/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`webPrep` = the background preparation that renders every scene so it is insertable on the web/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/prepareAllScenes \/ pausePreparation/);
+    // S-198: a muted panel bus in Compose is a silentRows reason too.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/a composer mute — of the track or of its panel bus — silences a row here too/);
   });
 
   it('teaches one arrangement per project (D-051): no lifecycle tools, no arrangementId', () => {
