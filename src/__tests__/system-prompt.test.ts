@@ -129,6 +129,26 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/arrangement_get` FIRST/);
   });
 
+  it('routes arrangement row mute / solo / restore and the loop to the arranger tools', () => {
+    // Song-wide row M / S are the arranger's own (not composer mutes); one
+    // instance's layer stays set_layer. Looping is ON over the whole song by
+    // default; a pending play starts by itself.
+    for (const name of [
+      'arrangement_set_track_mute',
+      'arrangement_set_track_solo',
+      'arrangement_restore_track',
+      'arrangement_get_loop',
+      'arrangement_set_loop',
+    ]) {
+      expect(DEFAULT_SYSTEM_PROMPT).toContain(name);
+    }
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT the composer's `dsl_track_mute` \/ `dsl_track_solo`/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/silentRows/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Playback LOOPS the whole arrangement by default/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/pending: true — it is preparing and starts by itself; don't call play again/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/deferred_until_stop: tell the user it opens once playback stops/);
+  });
+
   it('routes song export to arrangement_export, not the scene or cloud export paths', () => {
     // S-062: the legacy LOOP-B export_arrangement is retired; arrangement_export
     // is an async job (Mix / Master preset / stems / editable stems / Ableton).
@@ -249,8 +269,9 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
 
   it('names only registered arrangement_* tools', () => {
     // Mirror of sas-app's registered arrangement_* tool names (src/main/tools,
-    // as of S-118). A name the prompt invents sends the agent to a
-    // tool_search dead end; add to this list only after the tool ships.
+    // as of S-118, + the row mute / solo / restore and loop tools). A name the
+    // prompt invents sends the agent to a tool_search dead end; add to this
+    // list only after the tool ships.
     const registered = new Set([
       'arrangement_start', 'arrangement_play', 'arrangement_stop', 'arrangement_status', 'arrangement_seek',
       'arrangement_loop_instance', 'arrangement_get', 'arrangement_insert_instance', 'arrangement_move_instance',
@@ -259,7 +280,8 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
       'arrangement_remove_treatment', 'arrangement_copy', 'arrangement_paste', 'arrangement_delete_region',
       'arrangement_duplicate', 'arrangement_split', 'arrangement_join', 'arrangement_undo', 'arrangement_redo',
       'arrangement_export', 'arrangement_export_cancel', 'arrangement_sync_status', 'arrangement_sync',
-      'arrangement_import_proposal', 'arrangement_share',
+      'arrangement_import_proposal', 'arrangement_share', 'arrangement_set_track_mute',
+      'arrangement_set_track_solo', 'arrangement_restore_track', 'arrangement_get_loop', 'arrangement_set_loop',
     ]);
     const named = DEFAULT_SYSTEM_PROMPT.match(/\barrangement_[a-z_]+/g) ?? [];
     expect(named.length).toBeGreaterThan(0);
