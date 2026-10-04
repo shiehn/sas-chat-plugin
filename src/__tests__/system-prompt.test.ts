@@ -193,6 +193,11 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"why can't I insert the Verse on the web"/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`webPrep` = the background preparation that renders every scene so it is insertable on the web/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/prepareAllScenes \/ pausePreparation/);
+    // D-089: background stem uploads — status `upload`, now:true = full speed,
+    // pauseUploads pauses / resumes them.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"why hasn't my phone got the new scene yet"/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`upload` = the background stem uploads that put new audio on the phone \/ web/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/now: true also uploads at full speed right away; pauseUploads true \/ false pauses \/ resumes the background uploads/);
     // S-210 (D-090) superseded S-198: mute / solo are per view — Compose's
     // mutes (track or bus) no longer silence an arrangement row.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/only the arranger's own M \/ S silence a row here; each entry says why: row-muted or other-row-soloed/);
