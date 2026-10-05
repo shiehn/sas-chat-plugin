@@ -167,6 +167,10 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_export` \(a job — wait with `wait_for_job`/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT `export_audio` \/ `ableton_export_\*`/);
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/\bexport_arrangement\b/);
+    // S-243: the export's name and tail, and where it went.
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/"where did my export go\?"/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`name` names the folder and its files \(remembered per project\), `tail` "auto" or 0–30 seconds/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/the job result's `folder` is where it went/);
   });
 
   it('routes arrangement sync / import / share to the local arrangement_* tools, not the cloud arranger_*', () => {
