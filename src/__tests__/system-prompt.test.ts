@@ -133,6 +133,15 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/arrangement_get` FIRST/);
   });
 
+  it('routes kick / scene levels to the arranger normalize + scene-gain tools, user-asked only', () => {
+    // S-270 kick normalization (D-106/D-114): one scene gain per scene; hand-set via set_scene_gain.
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_normalize_kick_levels');
+    expect(DEFAULT_SYSTEM_PROMPT).toContain('arrangement_set_scene_gain');
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`arrangement_normalize_kick_levels` \(only when the user asks/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/refused while playback runs — ask before stopping it/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/a later normalize overwrites that scene unless it is excluded/);
+  });
+
   it('routes arrangement row mute / solo / restore and the loop to the arranger tools', () => {
     // Song-wide row M / S are the arranger's own, per view (S-210: Compose's
     // mutes / solos never reach it); one instance's layer stays set_layer. Looping is ON over the whole song by
@@ -312,6 +321,7 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
       'arrangement_export', 'arrangement_export_cancel', 'arrangement_sync_status', 'arrangement_sync',
       'arrangement_import_proposal', 'arrangement_share', 'arrangement_set_track_mute',
       'arrangement_set_track_solo', 'arrangement_restore_track', 'arrangement_get_loop', 'arrangement_set_loop',
+      'arrangement_normalize_kick_levels', 'arrangement_set_scene_gain',
     ]);
     const named = DEFAULT_SYSTEM_PROMPT.match(/\barrangement_[a-z_]+/g) ?? [];
     expect(named.length).toBeGreaterThan(0);
