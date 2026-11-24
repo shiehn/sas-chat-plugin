@@ -30,14 +30,14 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/1-4 bars/);
   });
 
-  it('defines both decks (LOOP-A=cue, LOOP-B=performance/main)', () => {
+  it('defines the LOOP-A deck (cue) and no longer teaches Deck B (D-674)', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/LOOP-A/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/cue/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/LOOP-B/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/performance/);
     // Channel assignment is part of the deck definition.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/channels 1-2/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/channels 3-4/);
+    // D-674 / S-871: Deck B (LOOP-B) is retired in the Rust-only app.
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/LOOP-B/i);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/channels 3-4/);
   });
 
   it('defines Musical context (a.k.a. contract)', () => {
@@ -96,7 +96,6 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/dsl_sound_history/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/dsl_sound_restore/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/scene_set_bars/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/performance_stack_add_node/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/recording_start/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_split_stems/);
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/ableton_export_scene/);
@@ -104,12 +103,14 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/add_instrument/);
   });
 
-  it('routes song-timeline asks to the arrangement tools, not the LOOP-B queue', () => {
+  it('routes song-timeline asks to the arrangement tools; the retired performance stack is gone', () => {
     // Local Arranger (S-060/S-061): project-scoped + deferred, so tool_search
     // reaches them — the prompt names them so "put the chorus twice after the
-    // verse" doesn't land on performance_stack_* (also "per-slot repeats").
+    // verse" lands on the arrangement. D-674 / S-871: the performance_stack_*
+    // tools (the LOOP-B set-list queue) were removed and must not be taught.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Arrangement:/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/NOT the LOOP-B queue/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/performance_stack_/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/LOOP-B queue/);
     for (const name of [
       'arrangement_get',
       'arrangement_insert_instance',
