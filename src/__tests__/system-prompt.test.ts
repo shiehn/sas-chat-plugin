@@ -75,9 +75,13 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/dsl_generate_midi/);
   });
 
-  it('defines Playback mode (performance vs solo)', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Playback mode/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Solo mode/);
+  it('describes the single stereo output, with no Performance/Solo playback mode (D-674)', () => {
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/ONE stereo pair/);
+    // D-674 / S-871: with Deck B retired there is no cue/main split and no
+    // Performance/Solo mode to teach.
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/Playback mode/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/Solo mode/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/Performance mode/);
   });
 
   it('points at design docs for implementation-detail questions', () => {
