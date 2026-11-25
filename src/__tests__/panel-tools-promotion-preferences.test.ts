@@ -143,6 +143,13 @@ describe('surface promotion (Phase 5b)', () => {
     expect(PROMOTED_PROJECT_TOOLS).not.toContain('create_transition');
     expect(PROMOTED_PROJECT_TOOLS).not.toContain('list_transitions');
   });
+
+  it('promotes the one undo history, not the refused checkpoint tools (D-679, J18)', () => {
+    expect(PROMOTED_PROJECT_TOOLS).toContain('user_undo');
+    expect(PROMOTED_PROJECT_TOOLS).toContain('user_redo');
+    expect(PROMOTED_PROJECT_TOOLS).not.toContain('sas_history_checkpoint');
+    expect(PROMOTED_PROJECT_TOOLS).not.toContain('sas_history_undo');
+  });
 });
 
 describe('producer_preferences (Phase 5c)', () => {

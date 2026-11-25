@@ -119,7 +119,7 @@ function resolveTransport(
  * declaration set (Phase 5b). The scene scan hides everything project-scoped
  * and deferred; before promotion the agent burned a tool_search hop for each
  * of these on every producer-loop turn (job polling, verify, inspect,
- * checkpoint/undo, transitions, deck transport, save). Promotion is DATA —
+ * undo/redo, transitions, deck transport, save). Promotion is DATA —
  * trim per Errantry friction diff. Each entry costs prompt tokens on every
  * request (~15 tools ≈ +3.8–5k tokens), so promote sparingly.
  */
@@ -129,8 +129,10 @@ export const PROMOTED_PROJECT_TOOLS: readonly string[] = [
   'sas_render_preview',
   'sas_inspect_project',
   'sas_inspect_scene',
-  'sas_history_checkpoint',
-  'sas_history_undo',
+  // The project's one undo history (D-679): named checkpoints are refused on
+  // the Rust-only app, user_undo / user_redo step every change (agent's too).
+  'user_undo',
+  'user_redo',
   // Transition-as-scene tools (the legacy create_transition / list_transitions
   // were deleted with the old pipeline). transition_remove stays tool_search-only.
   'create_transition_scene',
@@ -1287,14 +1289,14 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
 
     const lines: string[] = ['=== Current state (auto-refreshed each turn) ==='];
 
-    // Project block: full id, surfaced as a bind-param hint so the agent
-    // knows EXACTLY where to use it (db_query AND project_id = ?).
+    // Project block: name + full id (no SQL hint: db_query is refused on the
+    // Rust-only app, D-682).
     if (project && typeof project.name === 'string') {
       lines.push(`Project name: "${project.name}"`);
     }
     if (project && typeof project.id === 'string') {
       lines.push(
-        `Project id  : ${project.id}   (use as \`project_id = ?\` bind param in db_query)`,
+        `Project id  : ${project.id}`,
       );
     }
 
@@ -1311,7 +1313,7 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
     }
     if (typeof activeSceneId === 'string') {
       lines.push(
-        `Active scene id  : ${activeSceneId}   (use as \`scene_id = ?\` in db_query; auto-injected into scene-scoped tools)`,
+        `Active scene id  : ${activeSceneId}   (auto-injected into scene-scoped tools; project_document_read path scene:<id>)`,
       );
     }
 
@@ -1392,7 +1394,7 @@ export async function buildAmbientContext(host: PluginHost): Promise<string> {
     if (scenes.length > 0) {
       const visible = scenes.slice(0, AMBIENT_MAX_SCENES);
       lines.push(
-        `Scenes (${scenes.length}) — pass scene_name when calling play_scene; scene_id only for db_query:`,
+        `Scenes (${scenes.length}) — pass scene_name when calling play_scene; scene_id for id-only reads (project_document_read path scene:<id>):`,
       );
       for (const s of visible) {
         const name = s.displayName ?? s.name ?? '(unnamed)';

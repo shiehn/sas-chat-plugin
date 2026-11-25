@@ -1052,15 +1052,17 @@ describe('buildAmbientContext', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const text = await buildAmbientContext(host as any);
 
-    // Project block: full id + bind-param hint, not just an 8-char prefix.
+    // Project block: full id, not just an 8-char prefix. No SQL bind-param
+    // hint: db_query is refused on the Rust-only app (D-682, J18).
     expect(text).toContain('Project name: "Demo"');
     expect(text).toContain('Project id  : proj-12345678-aaaa-bbbb-cccc-dddddddddddd');
-    expect(text).toMatch(/project_id = \?/);
+    expect(text).not.toMatch(/db_query/);
+    expect(text).not.toMatch(/project_id = \?/);
 
-    // Active scene block: full id + usage hint.
+    // Active scene block: full id + usage hint (project_document_read, not SQL).
     expect(text).toContain('Active scene name: "Verse 1"');
     expect(text).toContain('Active scene id  : scene-aaaa1111-2222-3333-4444-555555555555');
-    expect(text).toMatch(/scene_id = \?/);
+    expect(text).toMatch(/project_document_read path scene:<id>/);
 
     // Scene listing uses the arrow format (name → id), no bracketed prefix.
     expect(text).toMatch(/"Verse 1"\s+→\s+id = scene-aaaa1111-2222-3333-4444-555555555555/);

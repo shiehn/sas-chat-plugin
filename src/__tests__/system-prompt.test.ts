@@ -30,9 +30,10 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/1-4 bars/);
   });
 
-  it('defines the LOOP-A deck (cue) and no longer teaches Deck B (D-674)', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/LOOP-A/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/cue/);
+  it('defines the LOOP-A deck and no longer teaches Deck B (D-674)', () => {
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Deck LOOP-A: the composition deck/);
+    // J18: the "cue" label went with the cue/main split; LOOP-A is not a cue deck.
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/LOOP-A \("cue"\)/);
     // Channel assignment is part of the deck definition.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/channels 1-2/);
     // D-674 / S-871: Deck B (LOOP-B) is retired in the Rust-only app.
@@ -126,7 +127,7 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     ]) {
       expect(DEFAULT_SYSTEM_PROMPT).toContain(name);
     }
-    // Separate undo history — the agent must not reach for history undo.
+    // Separate undo history — the agent must not reach for user_undo here.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/arrangement_undo` \(its own history/);
     // P2: own-only undo — "undo what I did on my phone" must use fromOtherDevice.
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/it undoes only THIS desktop's own edits/);
@@ -349,11 +350,24 @@ describe('DEFAULT_SYSTEM_PROMPT — S&S domain vocabulary', () => {
     expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_inspect_project/);
   });
 
-  it('promotes db_query as the agent\'s state-question escape hatch', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/db_query/);
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/db_describe_schema/);
-    // The DB-scoping rule (cross-project leakage protection).
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/project_id/);
+  it('answers state questions from the project document, not SQL (D-682, J18)', () => {
+    // The Rust-only app refuses db_query / db_describe_schema: the project
+    // file is the truth. The prompt points at what works instead.
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/db_query/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/db_describe_schema/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/always visible/);
+    for (const name of ['project_document_read', 'project_intent_log', 'sas_inspect_project', 'sas_inspect_scene', 'sas_inspect_track', 'fx_list_params', 'system_get_health']) {
+      expect(DEFAULT_SYSTEM_PROMPT).toContain(name);
+    }
+  });
+
+  it('teaches the one undo history, not checkpoints (D-679, J18)', () => {
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/history undo/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/auto-checkpoints/);
+    expect(DEFAULT_SYSTEM_PROMPT).not.toMatch(/sas_history_(checkpoint|undo)/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/`user_undo` \/ `user_redo`/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/sas_history_list/);
+    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/can undo via `user_undo`/);
   });
 
   it('makes "inspect first on fuzzy reference" explicit in the work loop', () => {
