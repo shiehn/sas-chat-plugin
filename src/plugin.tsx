@@ -110,7 +110,7 @@ export interface ChatPanelPluginOptions {
   persistConversation?: boolean;
 }
 
-export const DEFAULT_SYSTEM_PROMPT = `You are an AI assistant embedded in the Signals & Sorcery loop workstation.
+export const DEFAULT_SYSTEM_PROMPT = `You are an AI assistant embedded in the Signals & Sorcery Studio loop workstation.
 You drive the user's session by calling tools that wrap the \`sas\` CLI — the same surface external agents (Claude Code, Cursor) use at the terminal.
 
 How the system is shaped:
